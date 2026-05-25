@@ -15,14 +15,14 @@ launch — switch environments and every newly-launched process picks up the new
 config. Everything is stored encrypted; secret values are never printed, and
 ordinary settings ride the exact same rails.
 
-> **Status: v0.8 — usable, early.** It manages any static configuration — secrets
+> **Status: v0.11 — usable, early.** It manages any static configuration — secrets
 > and plain settings alike. The full local workflow is implemented and tested:
 > per-environment injection, layered environments, reflog-style history with
-> rollback, a code-aware doctor, value generators, zero-step onboarding, an
-> interactive TUI, a **100+ service catalog** (`envd add stripe`, `neon`, …), and
-> **live references into 1Password, Vault, AWS, GCP, Azure, Doppler, Infisical, and
-> more** via their CLIs. Remote platform *sync* (pushing to Fly/Cloudflare/Encore)
-> is the main deferred piece.
+> rollback, a code-aware doctor, value generators, **one-command assimilation of
+> existing `.env*` projects**, an interactive TUI, a **100+ service catalog**
+> (`envd add stripe`, `neon`, …), and **live references into 1Password, Vault, AWS,
+> GCP, Azure, Doppler, Infisical, and more** via their CLIs. Remote platform *sync*
+> (pushing to Fly/Cloudflare/Encore) is the main deferred piece.
 >
 > The daemon core is pure Go stdlib; only the TUI pulls in third-party libraries
 > (Bubble Tea). Everything ships as one binary.
@@ -115,6 +115,8 @@ envd use dev            # back to dev
 | `envd diff <envA> <envB>` | Show which keys differ between two environments (values masked). |
 | `envd doctor [--env e] [--example]` | Scan code for env-var refs; flag missing/empty/placeholder/unused. `--example` writes `.env.example`. |
 | `envd import [file] [--env e]` | Import a `.env` file (default `./.env`) into an environment. |
+| `envd assimilate [--force]` | Discover a project's `.env*` files, map them to environments, and ingest them (auto-creates the project). |
+| `envd sync [--force]` | Detect manual edits to the project's `.env` files and reconcile the vault (confirms first). |
 | `envd adopt` | Register an existing on-disk vault (e.g. a freshly-cloned repo). |
 | `envd providers` | List supported provider reference schemes and CLI availability. |
 | `envd tui` | Open the interactive vault/environment manager. |
@@ -285,11 +287,56 @@ app/dev — scanned 37 file(s), 12 var(s) referenced
 
 ## Onboarding (zero steps)
 
+- **Assimilate an existing project:** `envd assimilate` discovers the conventional
+  dotenv files and brings the whole project under envd in one command —
+  auto-creating it if needed:
+
+  ```sh
+  cd ~/existing-app && envd assimilate
+  # discovered: .env, .env.local, .env.development, .env.production, .env.production.local
+  # created project and assimilated "existing-app"
+  #   environments: dev, prod
+  #   imported 11 value(s)
+  ```
+
+  It maps files using standard dotenv precedence — `.env`/`.env.local` → `base`,
+  `.env.<mode>` → that environment, `.local` variants override — hoists values
+  shared by every environment into `base`, and skips templates (`.env.example`,
+  `.env.vault`, …).
+
+  Crucially, **it doesn't stop at `.env` files** (which are often incomplete): it
+  also scans your code for referenced env vars (like `envd doctor`) and fills any
+  gaps using robust heuristics — your current shell environment, then inline code
+  defaults (`process.env.PORT || 3000`, `os.getenv("X", "default")`). Anything
+  referenced but undeterminable is stored blank and **reported with a warning** so
+  you know exactly what to fill in; OS/shell vars like `PATH`/`HOME` are ignored.
+  Existing vault values are kept unless `--force`.
 - **Auto-adopt:** clone a repo that already has `.envd/vault.json`, `cd` into it,
   and (if the decryption key is available) the daemon registers it automatically
-  and starts injecting — no `connect` needed. `envd adopt` does it explicitly.
-- **Import:** `envd import .env` absorbs an existing dotenv file into an
+  and starts injecting — no `init` needed. `envd adopt` does it explicitly.
+- **Import one file:** `envd import .env` absorbs a single dotenv file into an
   environment (`--env base` to put shared keys in the base layer).
+
+## Staying in sync with manual `.env` edits
+
+If you keep `.env` files around and edit them by hand, envd notices. It remembers
+the `.env` state from the last sync and detects what you changed — keys added,
+removed, or changed — then reconciles the vault **on your confirmation**:
+
+```sh
+envd sync
+# manual .env changes since last sync:
+#   + base/STRIPE_KEY = •••   (added)
+#   ~ dev/DATABASE_URL = •••  (changed)
+#   - base/OLD_FLAG           (removed)
+# apply these .env changes to the vault? [y/N]
+```
+
+It's deliberately un-surprising: nothing is applied without you seeing the exact
+diff and confirming. In the TUI, opening a project shows a banner when changes are
+pending (`⚠ N manual .env change(s) — press S to review & sync`); `S` opens a
+review screen where `a` applies and `esc` dismisses. A fully-migrated project with
+no `.env` files is left alone — it won't propose removing everything.
 
 ## Providers — two paths
 

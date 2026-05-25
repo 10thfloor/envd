@@ -43,7 +43,7 @@ import (
 
 const (
 	appName = "envd"
-	version = "0.10.0"
+	version = "0.11.0"
 )
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,9 @@ type Vault struct {
 	Providers    map[string]ProviderState     `json:"providers"` // provider name -> token/bindings
 	History      []HistoryEntry               `json:"history,omitempty"`
 	NextSeq      int                          `json:"next_seq,omitempty"`
+	// EnvBaseline is the .env-derived layers as of the last assimilate/sync, used
+	// to detect manual edits (added/removed/changed) to the project's .env files.
+	EnvBaseline map[string]map[string]string `json:"env_baseline,omitempty"`
 }
 
 // HistoryEntry is one recorded mutation (reflog-like). It carries the prior
@@ -296,11 +299,12 @@ func saveVault(root string, v *Vault, vf *vaultFile, key []byte) error {
 // ---------------------------------------------------------------------------
 
 type Request struct {
-	Cmd     string            `json:"cmd"`
-	Cwd     string            `json:"cwd,omitempty"`
-	Applied []string          `json:"applied,omitempty"`
-	Args    map[string]string `json:"args,omitempty"`
-	KV      map[string]string `json:"kv,omitempty"` // bulk payload (import)
+	Cmd     string                       `json:"cmd"`
+	Cwd     string                       `json:"cwd,omitempty"`
+	Applied []string                     `json:"applied,omitempty"`
+	Args    map[string]string            `json:"args,omitempty"`
+	KV      map[string]string            `json:"kv,omitempty"`     // bulk payload (import)
+	Layers  map[string]map[string]string `json:"layers,omitempty"` // env -> KV (assimilate); "base" = shared
 }
 
 type Response struct {
@@ -315,6 +319,88 @@ type Response struct {
 	Doctor      *DoctorReport     `json:"doctor,omitempty"`
 	History     []HistoryEntry    `json:"history,omitempty"`
 	NeedConfirm bool              `json:"need_confirm,omitempty"` // mutation would overwrite; retry with force
+	Drift       *DriftReport      `json:"drift,omitempty"`
+}
+
+// DriftItem is one manual change to a project's .env files relative to the vault.
+type DriftItem struct {
+	Env   string `json:"env"`
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"` // new value (added/changed); empty for removed
+}
+
+// DriftReport describes manual .env edits since the last sync.
+type DriftReport struct {
+	Added   []DriftItem `json:"added,omitempty"`
+	Changed []DriftItem `json:"changed,omitempty"`
+	Removed []DriftItem `json:"removed,omitempty"`
+}
+
+func (r *DriftReport) empty() bool {
+	return r == nil || len(r.Added)+len(r.Changed)+len(r.Removed) == 0
+}
+
+func (r *DriftReport) count() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.Added) + len(r.Changed) + len(r.Removed)
+}
+
+// computeDrift diffs the current .env-derived layers against the baseline.
+func computeDrift(baseline, current map[string]map[string]string) *DriftReport {
+	r := &DriftReport{}
+	envs := map[string]bool{}
+	for e := range baseline {
+		envs[e] = true
+	}
+	for e := range current {
+		envs[e] = true
+	}
+	envNames := make([]string, 0, len(envs))
+	for e := range envs {
+		envNames = append(envNames, e)
+	}
+	sort.Strings(envNames)
+	for _, env := range envNames {
+		base, cur := baseline[env], current[env]
+		keys := map[string]bool{}
+		for k := range base {
+			keys[k] = true
+		}
+		for k := range cur {
+			keys[k] = true
+		}
+		names := make([]string, 0, len(keys))
+		for k := range keys {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			bv, inBase := base[k]
+			cv, inCur := cur[k]
+			switch {
+			case inCur && !inBase:
+				r.Added = append(r.Added, DriftItem{env, k, cv})
+			case !inCur && inBase:
+				r.Removed = append(r.Removed, DriftItem{env, k, ""})
+			case inCur && inBase && bv != cv:
+				r.Changed = append(r.Changed, DriftItem{env, k, cv})
+			}
+		}
+	}
+	if r.empty() {
+		return nil
+	}
+	return r
+}
+
+func totalKeys(layers map[string]map[string]string) int {
+	n := 0
+	for _, m := range layers {
+		n += len(m)
+	}
+	return n
 }
 
 // DoctorReport is the result of scanning project source for env-var references
@@ -1130,6 +1216,12 @@ func (d *Daemon) handleSet(req Request) Response {
 func (d *Daemon) handleRegister(req Request) Response {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.registerLocked(req)
+}
+
+// registerLocked is handleRegister's body; assumes d.mu is held so it can be
+// reused by other handlers (e.g. assimilate).
+func (d *Daemon) registerLocked(req Request) Response {
 	name := arg(req, "name")
 	path := filepath.Clean(req.Cwd)
 	var envs []string
@@ -1535,8 +1627,9 @@ func looksPlaceholder(v string) bool { return placeholderRe.MatchString(strings.
 
 // scanEnvRefs walks root and returns the sorted set of env-var names referenced
 // in source files, plus the number of files scanned.
-func scanEnvRefs(root string) ([]string, int) {
-	set := map[string]bool{}
+// walkSource calls fn with the contents of each scannable source file under root
+// (skipping vendor/build dirs and large/non-source files), returning the count.
+func walkSource(root string, fn func(data []byte)) int {
 	files := 0
 	_ = filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
 		if err != nil {
@@ -1559,12 +1652,20 @@ func scanEnvRefs(root string) ([]string, int) {
 			return nil
 		}
 		files++
+		fn(data)
+		return nil
+	})
+	return files
+}
+
+func scanEnvRefs(root string) ([]string, int) {
+	set := map[string]bool{}
+	files := walkSource(root, func(data []byte) {
 		for _, re := range envRefPatterns {
 			for _, m := range re.FindAllStringSubmatch(string(data), -1) {
 				set[m[1]] = true
 			}
 		}
-		return nil
 	})
 	out := make([]string, 0, len(set))
 	for k := range set {
@@ -1572,6 +1673,75 @@ func scanEnvRefs(root string) ([]string, int) {
 	}
 	sort.Strings(out)
 	return out, files
+}
+
+// envDefaultPatterns capture an inline fallback for a referenced env var, e.g.
+// `process.env.PORT || 3000` or `os.getenv("X", "default")`.
+var envDefaultPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`process\.env\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\|\||\?\?)\s*['"]([^'"]*)['"]`),
+	regexp.MustCompile(`process\.env\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]\s*(?:\|\||\?\?)\s*['"]([^'"]*)['"]`),
+	regexp.MustCompile(`process\.env\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\|\||\?\?)\s*(\d+)`),
+	regexp.MustCompile(`os\.getenv\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*,\s*['"]([^'"]*)['"]`),
+	regexp.MustCompile(`os\.environ\.get\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*,\s*['"]([^'"]*)['"]`),
+}
+
+// discoverDefaults scans source for inline env-var fallbacks → KEY=default value
+// (first occurrence wins).
+func discoverDefaults(root string) map[string]string {
+	out := map[string]string{}
+	walkSource(root, func(data []byte) {
+		for _, re := range envDefaultPatterns {
+			for _, m := range re.FindAllStringSubmatch(string(data), -1) {
+				if _, ok := out[m[1]]; !ok {
+					out[m[1]] = m[2]
+				}
+			}
+		}
+	})
+	return out
+}
+
+// systemEnvDeny are shell/system vars we never capture from the environment even
+// if the code references them.
+var systemEnvDeny = map[string]bool{
+	"PATH": true, "HOME": true, "SHELL": true, "USER": true, "LOGNAME": true,
+	"PWD": true, "OLDPWD": true, "TMPDIR": true, "TERM": true, "LANG": true,
+	"SHLVL": true, "_": true,
+}
+
+// resolveReferenced fills layers["base"] for code-referenced keys that no .env
+// file provided, using (1) the current environment, then (2) an inline code
+// default; anything left is stored blank and reported as undetermined.
+func resolveReferenced(layers map[string]map[string]string, referenced []string, defaults map[string]string, lookupEnv func(string) (string, bool)) (fromEnv, fromDefault, undetermined []string) {
+	if layers["base"] == nil {
+		layers["base"] = map[string]string{}
+	}
+	present := func(k string) bool {
+		for _, m := range layers {
+			if _, ok := m[k]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	sorted := append([]string(nil), referenced...)
+	sort.Strings(sorted)
+	for _, k := range sorted {
+		if present(k) {
+			continue
+		}
+		if v, ok := lookupEnv(k); ok {
+			layers["base"][k] = v
+			fromEnv = append(fromEnv, k)
+		} else if d, ok := defaults[k]; ok {
+			layers["base"][k] = d
+			fromDefault = append(fromDefault, k)
+		} else {
+			layers["base"][k] = "" // referenced but undetermined — track + warn
+			undetermined = append(undetermined, k)
+		}
+	}
+	return fromEnv, fromDefault, undetermined
 }
 
 func (d *Daemon) handleDoctor(req Request) Response {
@@ -1625,7 +1795,20 @@ func (d *Daemon) handleDoctor(req Request) Response {
 			rep.Placeholder = append(rep.Placeholder, k)
 		}
 	}
-	return Response{OK: true, Doctor: rep, Text: doctorText(p.Name, rep)}
+	text := doctorText(p.Name, rep)
+	if arg(req, "example") == "true" {
+		var b strings.Builder
+		b.WriteString("# Generated by envd — required environment variables (no values).\n")
+		for _, k := range referenced {
+			b.WriteString(k + "=\n")
+		}
+		path := filepath.Join(p.Path, ".env.example")
+		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+			return Response{Error: err.Error()}
+		}
+		text += fmt.Sprintf("\n✓ wrote %s (%d keys)\n", path, len(referenced))
+	}
+	return Response{OK: true, Doctor: rep, Text: text}
 }
 
 func doctorText(project string, r *DoctorReport) string {
@@ -1706,6 +1889,181 @@ func (d *Daemon) handleAdopt(req Request) Response {
 		return Response{Error: err.Error()}
 	}
 	return Response{OK: true, Text: msg}
+}
+
+// handleAssimilate ingests discovered dotenv layers into a project, auto-creating
+// it (or adopting an existing vault) if needed. Existing values are preserved
+// unless force is set.
+func (d *Daemon) handleAssimilate(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cwd := filepath.Clean(req.Cwd)
+	created := false
+	p := d.findProject(cwd)
+	if p == nil {
+		if _, err := os.Stat(vaultPath(cwd)); err == nil { // adopt an existing vault
+			if _, err := d.adopt(cwd); err != nil {
+				return Response{Error: err.Error()}
+			}
+		} else { // register a fresh project, with the discovered modes as its envs
+			var envs []string
+			for e := range req.Layers {
+				if e != "base" {
+					envs = append(envs, e)
+				}
+			}
+			if len(envs) == 0 {
+				envs = []string{"dev"}
+			}
+			sort.Strings(envs)
+			rr := d.registerLocked(Request{Cwd: cwd, Args: map[string]string{
+				"name": arg(req, "name"), "envs": strings.Join(envs, ","), "kdf": arg(req, "kdf"),
+			}})
+			if !rr.OK {
+				return rr
+			}
+			created = true
+		}
+		p = d.findProject(cwd)
+	}
+	u, err := d.getUnlocked(p)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+
+	// ensure every discovered mode env exists
+	for env := range req.Layers {
+		if env == "base" {
+			continue
+		}
+		if _, ok := u.vault.Values[env]; !ok {
+			u.vault.Values[env] = map[string]string{}
+			u.vault.Environments = append(u.vault.Environments, env)
+			p.Envs = append(p.Envs, env)
+		}
+	}
+
+	force := arg(req, "force") == "true"
+	imported, skipped := 0, 0
+	for _, env := range sortedLayerKeys(req.Layers) {
+		layer := u.layer(env)
+		for k, v := range req.Layers[env] {
+			old, had := layer[k]
+			if had && old == v {
+				continue
+			}
+			if had && !force {
+				skipped++
+				continue
+			}
+			layer[k] = v
+			u.record(HistoryEntry{Op: "set", Env: env, Key: k, Old: old, HadOld: had, New: v})
+			imported++
+		}
+	}
+	// Record the current .env state as the baseline for future drift detection.
+	u.vault.EnvBaseline = discoverEnvFiles(p.Path)
+	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
+		return Response{Error: err.Error()}
+	}
+	d.saveState()
+
+	var b strings.Builder
+	verb := "assimilated into existing project"
+	if created {
+		verb = "created project and assimilated"
+	}
+	fmt.Fprintf(&b, "%s %q\n", verb, p.Name)
+	fmt.Fprintf(&b, "  environments: %s\n", strings.Join(p.Envs, ", "))
+	fmt.Fprintf(&b, "  imported %d value(s)", imported)
+	if skipped > 0 {
+		fmt.Fprintf(&b, "; skipped %d existing (pass --force to overwrite)", skipped)
+	}
+	b.WriteString("\n")
+	return Response{OK: true, Text: b.String()}
+}
+
+// driftFor computes the project's .env drift against its baseline. Assumes d.mu
+// is held. Returns nil drift when there are no .env files (a fully-migrated
+// project shouldn't be nagged to "remove" everything) or when nothing changed.
+// Establishes the baseline silently on first encounter.
+func (d *Daemon) driftFor(p *Project, u *unlocked) *DriftReport {
+	current := discoverEnvFiles(p.Path)
+	if totalKeys(current) == 0 {
+		return nil
+	}
+	if u.vault.EnvBaseline == nil {
+		u.vault.EnvBaseline = current
+		_ = saveVault(p.Path, u.vault, u.vf, u.key)
+		return nil
+	}
+	return computeDrift(u.vault.EnvBaseline, current)
+}
+
+func (d *Daemon) handleDrift(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findProjectByReq(req)
+	if p == nil {
+		return Response{Error: "no such project"}
+	}
+	u, err := d.getUnlocked(p)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	return Response{OK: true, Drift: d.driftFor(p, u)}
+}
+
+// handleApplyDrift reconciles the vault with the current .env files (apply the
+// adds/changes, delete the removals) and advances the baseline.
+func (d *Daemon) handleApplyDrift(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findProjectByReq(req)
+	if p == nil {
+		return Response{Error: "no such project"}
+	}
+	u, err := d.getUnlocked(p)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	current := discoverEnvFiles(p.Path)
+	drift := computeDrift(u.vault.EnvBaseline, current)
+	if drift.empty() {
+		return Response{OK: true, Text: "already in sync"}
+	}
+	ensureEnv := func(env string) {
+		if env == "base" {
+			return
+		}
+		if _, ok := u.vault.Values[env]; !ok {
+			u.vault.Values[env] = map[string]string{}
+			u.vault.Environments = append(u.vault.Environments, env)
+			p.Envs = append(p.Envs, env)
+		}
+	}
+	for _, it := range append(append([]DriftItem{}, drift.Added...), drift.Changed...) {
+		ensureEnv(it.Env)
+		layer := u.layer(it.Env)
+		old, had := layer[it.Key]
+		layer[it.Key] = it.Value
+		u.record(HistoryEntry{Op: "set", Env: it.Env, Key: it.Key, Old: old, HadOld: had, New: it.Value})
+	}
+	for _, it := range drift.Removed {
+		if layer, ok := u.readLayer(it.Env); ok {
+			if old, had := layer[it.Key]; had {
+				delete(layer, it.Key)
+				u.record(HistoryEntry{Op: "unset", Env: it.Env, Key: it.Key, Old: old, HadOld: true})
+			}
+		}
+	}
+	u.vault.EnvBaseline = current
+	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
+		return Response{Error: err.Error()}
+	}
+	d.saveState()
+	return Response{OK: true, Text: fmt.Sprintf("applied %d .env change(s): +%d ~%d -%d",
+		drift.count(), len(drift.Added), len(drift.Changed), len(drift.Removed))}
 }
 
 func cloneMap(m map[string]string) map[string]string {
@@ -1985,6 +2343,12 @@ func (d *Daemon) serve(conn net.Conn) {
 		resp = d.handleImport(req)
 	case "adopt":
 		resp = d.handleAdopt(req)
+	case "assimilate":
+		resp = d.handleAssimilate(req)
+	case "drift":
+		resp = d.handleDrift(req)
+	case "applydrift":
+		resp = d.handleApplyDrift(req)
 	case "history":
 		resp = d.handleHistory(req)
 	case "restore":
@@ -2466,20 +2830,163 @@ func cmdDiff(args []string) {
 func cmdDoctor(args []string) {
 	_, flags := parseFlags(args)
 	cwd, _ := os.Getwd()
-	resp := mustCall(Request{Cmd: "doctor", Cwd: cwd, Args: map[string]string{"env": flags["env"]}})
-	fmt.Print(resp.Text)
-	if flags["example"] != "" && resp.Doctor != nil {
-		var b strings.Builder
-		b.WriteString("# Generated by envd — required environment variables (no values).\n")
-		for _, k := range resp.Doctor.Referenced {
-			b.WriteString(k + "=\n")
-		}
-		path := filepath.Join(cwd, ".env.example")
-		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-			fatal(err)
-		}
-		fmt.Printf("✓ wrote %s (%d keys)\n", path, len(resp.Doctor.Referenced))
+	a := map[string]string{"env": flags["env"]}
+	if flags["example"] != "" {
+		a["example"] = "true" // daemon writes .env.example to the project root
 	}
+	resp := mustCall(Request{Cmd: "doctor", Cwd: cwd, Args: a})
+	fmt.Print(resp.Text)
+}
+
+// ---------------------------------------------------------------------------
+// Project assimilation: discover conventional dotenv files and map them onto
+// envd's base + per-environment layers using the standard dotenv precedence.
+//   .env, .env.local            → base (shared; .local overrides)
+//   .env.<mode>, .env.<mode>.local → <mode> env (.local overrides)
+// Keys common to every mode are hoisted to base; mode keys equal to base drop.
+// ---------------------------------------------------------------------------
+
+func normalizeMode(m string) string {
+	switch m {
+	case "development", "dev":
+		return "dev"
+	case "production", "prod":
+		return "prod"
+	case "staging", "stage":
+		return "staging"
+	case "test", "testing":
+		return "test"
+	}
+	return m
+}
+
+// classifyEnvFile maps a filename to (envName, isLocal, ok). envName "base" is the
+// shared layer. Template/non-value files (.env.example, .env.vault, …) are skipped.
+func classifyEnvFile(name string) (env string, local bool, ok bool) {
+	switch name {
+	case ".env":
+		return "base", false, true
+	case ".env.local":
+		return "base", true, true
+	}
+	if !strings.HasPrefix(name, ".env.") {
+		return "", false, false
+	}
+	rest := name[len(".env."):]
+	local = strings.HasSuffix(rest, ".local")
+	rest = strings.TrimSuffix(rest, ".local")
+	switch rest {
+	case "", "example", "sample", "template", "dist", "defaults", "schema", "vault", "keys":
+		return "", false, false
+	}
+	return normalizeMode(rest), local, true
+}
+
+// discoverEnv reads the dotenv files in dir and returns env -> KV layers (with a
+// "base" layer) plus the filenames it used.
+func discoverEnv(dir string) (map[string]map[string]string, []string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	type ef struct {
+		env, path string
+		local     bool
+	}
+	var files []ef
+	var used []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		env, local, ok := classifyEnvFile(e.Name())
+		if !ok {
+			continue
+		}
+		files = append(files, ef{env: env, path: filepath.Join(dir, e.Name()), local: local})
+		used = append(used, e.Name())
+	}
+	sort.Strings(used)
+	layers := map[string]map[string]string{}
+	// non-local first, then local overrides
+	for _, pass := range []bool{false, true} {
+		for _, f := range files {
+			if f.local != pass {
+				continue
+			}
+			data, err := os.ReadFile(f.path)
+			if err != nil {
+				continue
+			}
+			if layers[f.env] == nil {
+				layers[f.env] = map[string]string{}
+			}
+			for k, v := range parseDotenv(data) {
+				layers[f.env][k] = v
+			}
+		}
+	}
+	hoistCommon(layers)
+	return layers, used
+}
+
+// discoverEnvFiles returns just the .env-derived layers for dir (used as the
+// drift baseline; daemon-side so it's consistent across checks).
+func discoverEnvFiles(dir string) map[string]map[string]string {
+	layers, _ := discoverEnv(dir)
+	return layers
+}
+
+// hoistCommon moves keys shared (same value) by every mode env into base, and
+// drops mode keys that merely duplicate a base value.
+func hoistCommon(layers map[string]map[string]string) {
+	if layers["base"] == nil {
+		layers["base"] = map[string]string{}
+	}
+	base := layers["base"]
+	var modes []string
+	for e := range layers {
+		if e != "base" {
+			modes = append(modes, e)
+		}
+	}
+	if len(modes) >= 2 {
+		for k, v := range layers[modes[0]] {
+			common := true
+			for _, m := range modes[1:] {
+				if mv, ok := layers[m][k]; !ok || mv != v {
+					common = false
+					break
+				}
+			}
+			if common {
+				if _, inBase := base[k]; !inBase {
+					base[k] = v
+				}
+			}
+		}
+	}
+	for _, m := range modes {
+		for k, v := range layers[m] {
+			if bv, ok := base[k]; ok && bv == v {
+				delete(layers[m], k)
+			}
+		}
+	}
+}
+
+func sortedLayerKeys(layers map[string]map[string]string) []string {
+	keys := make([]string, 0, len(layers))
+	for k := range layers {
+		if k != "base" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if _, ok := layers["base"]; ok {
+		keys = append([]string{"base"}, keys...) // base first
+	}
+	return keys
 }
 
 // parseDotenv parses a .env file into key/value pairs (supports `export `,
@@ -2535,6 +3042,71 @@ func cmdAdopt() {
 	cwd, _ := os.Getwd()
 	resp := mustCall(Request{Cmd: "adopt", Cwd: cwd})
 	fmt.Printf("✓ %s\n", resp.Text)
+}
+
+func cmdAssimilate(args []string) {
+	_, flags := parseFlags(args)
+	cwd, _ := os.Getwd()
+
+	// 1. discover values from conventional dotenv files
+	layers, files := discoverEnv(cwd)
+	if len(files) > 0 {
+		fmt.Fprintf(os.Stderr, "dotenv files: %s\n", strings.Join(files, ", "))
+	}
+
+	// 2. scan the code for referenced env vars and fill any the .env files missed,
+	//    using the current environment, then inline code defaults.
+	referenced, scanned := scanEnvRefs(cwd)
+	// Drop shell/OS-provided vars (PATH, HOME, …) — they're not project config and
+	// must never be tracked as blank (that would clobber the real value at inject).
+	var refs []string
+	for _, k := range referenced {
+		if !systemEnvDeny[k] {
+			refs = append(refs, k)
+		}
+	}
+	defaults := discoverDefaults(cwd)
+	lookup := func(k string) (string, bool) {
+		v, ok := os.LookupEnv(k)
+		if !ok || strings.TrimSpace(v) == "" {
+			return "", false
+		}
+		return v, true
+	}
+	fromEnv, fromDefault, undetermined := resolveReferenced(layers, refs, defaults, lookup)
+	fmt.Fprintf(os.Stderr, "scanned %d source file(s); %d env var(s) referenced in code\n", scanned, len(referenced))
+
+	if len(layers["base"]) == 0 {
+		delete(layers, "base")
+	}
+	if len(layers) == 0 {
+		fatalf("nothing to assimilate: no .env files and no env-var references found in %s", cwd)
+	}
+
+	kdf := "keychain"
+	if os.Getenv("ENVD_PASSPHRASE") != "" {
+		kdf = "pbkdf2"
+	} else if !keychainAvailable() {
+		fatalf("no macOS Keychain available; set ENVD_PASSPHRASE to use the passphrase fallback")
+	}
+	a := map[string]string{"name": filepath.Base(cwd), "kdf": kdf}
+	if flags["force"] != "" || flags["f"] != "" {
+		a["force"] = "true"
+	}
+	resp := mustCall(Request{Cmd: "assimilate", Cwd: cwd, Layers: layers, Args: a})
+	fmt.Print(resp.Text)
+
+	if len(fromEnv) > 0 {
+		fmt.Printf("  captured from your shell env: %s\n", strings.Join(fromEnv, ", "))
+	}
+	if len(fromDefault) > 0 {
+		fmt.Printf("  captured from code defaults:  %s\n", strings.Join(fromDefault, ", "))
+	}
+	if len(undetermined) > 0 {
+		fmt.Printf("\n⚠ %d referenced var(s) need a value (stored blank): %s\n", len(undetermined), strings.Join(undetermined, ", "))
+		fmt.Printf("  set them with `envd set <KEY>` (run `envd doctor` anytime to recheck).\n")
+	}
+	fmt.Println("\nReview with `envd tui` or `envd diff`. Once envd manages these, you can remove the .env files (the vault is committed; .env stays gitignored).")
 }
 
 func pickProjectForCwd(ps []ProjectView, cwd string) *ProjectView {
@@ -2711,6 +3283,40 @@ func cmdCatalog(args []string) {
 	fmt.Printf("\n%d services. Scaffold one with: envd add <name> [--env e]\n", n)
 }
 
+func formatDrift(d *DriftReport) string {
+	var b strings.Builder
+	b.WriteString("manual .env changes since last sync:\n")
+	for _, it := range d.Added {
+		fmt.Fprintf(&b, "  + %s/%s = %s   (added)\n", it.Env, it.Key, maskStr(it.Value))
+	}
+	for _, it := range d.Changed {
+		fmt.Fprintf(&b, "  ~ %s/%s = %s   (changed)\n", it.Env, it.Key, maskStr(it.Value))
+	}
+	for _, it := range d.Removed {
+		fmt.Fprintf(&b, "  - %s/%s   (removed)\n", it.Env, it.Key)
+	}
+	return b.String()
+}
+
+func cmdSync(args []string) {
+	_, flags := parseFlags(args)
+	cwd, _ := os.Getwd()
+	resp := mustCall(Request{Cmd: "drift", Cwd: cwd})
+	if resp.Drift.empty() {
+		fmt.Println("✓ in sync — no manual .env changes detected")
+		return
+	}
+	fmt.Print(formatDrift(resp.Drift))
+	if flags["force"] == "" && flags["f"] == "" {
+		if !confirm("apply these .env changes to the vault?") {
+			fmt.Fprintln(os.Stderr, "cancelled — vault unchanged")
+			return
+		}
+	}
+	r := mustCall(Request{Cmd: "applydrift", Cwd: cwd})
+	fmt.Printf("✓ %s\n", r.Text)
+}
+
 func cmdProviders() {
 	resp := mustCall(Request{Cmd: "providers"})
 	fmt.Print(resp.Text)
@@ -2730,9 +3336,14 @@ Usage:
   envd init                  Register the current directory as a project.
   envd connect <provider>    OAuth-connect a provider and import its values.
   envd adopt                 Register an existing on-disk vault (cloned repo).
+  envd assimilate [--force]  Discover this project's dotenv files (.env, .env.local,
+                             .env.<mode>, …), map them to environments, and ingest
+                             them into the vault — auto-creating the project.
   envd import [file] [--env e] [--force]
                              Import a .env file (default ./.env). Skips existing keys
                              unless --force.
+  envd sync [--force]        Detect manual edits to this project's .env files and
+                             reconcile the vault (confirms first, or use the TUI).
   envd use <env>             Set the active environment for this project.
   envd env add <name>        Add a new environment (projects start with just 'dev').
   envd env rm <name>         Remove an environment.
@@ -2822,6 +3433,10 @@ func main() {
 		cmdImport(rest)
 	case "adopt":
 		cmdAdopt()
+	case "assimilate", "absorb":
+		cmdAssimilate(rest)
+	case "sync":
+		cmdSync(rest)
 	case "tui":
 		runTUI()
 	case "add":

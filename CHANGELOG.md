@@ -6,6 +6,38 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-05-25
+
+### Added
+- **`envd assimilate`** — bring an existing project under envd in one step. It:
+  - discovers the conventional dotenv files (`.env`, `.env.local`, `.env.<mode>`,
+    `.env.<mode>.local`), maps each onto envd's layers using standard dotenv
+    precedence (`.env`/`.env.local` → `base`; `.env.<mode>` → that environment;
+    `.local` variants override), hoists values shared by every environment into
+    `base`, and skips template files (`.env.example`, `.env.vault`, …);
+  - **scans the code for referenced env vars** (like `doctor`) and fills any the
+    `.env` files didn't cover, using robust heuristics — first your current shell
+    environment, then inline code defaults (`process.env.PORT || 3000`,
+    `os.getenv("X", "default")`);
+  - **warns** about referenced vars whose value it couldn't determine (stored
+    blank for you to fill); ignores OS/shell vars like `PATH`/`HOME`;
+  - writes everything into the vault, auto-creating the project (with the
+    discovered environments) if it isn't registered. Existing values are preserved
+    unless `--force`.
+- **Drift detection (`envd sync` + TUI).** After assimilating, envd remembers the
+  `.env` baseline and detects manual edits you make to those files — keys added,
+  removed, or changed — and reconciles the vault on your confirmation. The diff is
+  shown explicitly (added/changed/removed, values masked) and never applied without
+  an OK, so it's never surprising. `envd sync` reviews + applies from the CLI
+  (confirms first, or `--force`); the TUI shows a banner on open and a review
+  screen under `S`. A fully-migrated project with no `.env` files is left alone (no
+  spurious "remove everything").
+
+### Fixed
+- `envd doctor --example` now writes `.env.example` to the **project root** (the
+  scanned directory) rather than the current working directory, so running it from
+  a subdirectory no longer puts the file somewhere unexpected.
+
 ## [0.10.0] — 2026-05-25
 
 ### Changed
@@ -115,7 +147,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AES-256-GCM), key in the macOS Keychain or via `ENVD_PASSPHRASE` (PBKDF2).
   Commands: `start`, `hook`, `connect`, `use`, `set`, `status`.
 
-[Unreleased]: https://github.com/10thfloor/envd/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/10thfloor/envd/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/10thfloor/envd/releases/tag/v0.11.0
 [0.10.0]: https://github.com/10thfloor/envd/releases/tag/v0.10.0
 [0.9.0]: https://github.com/10thfloor/envd/releases/tag/v0.9.0
 [0.8.0]: https://github.com/10thfloor/envd/releases/tag/v0.8.0

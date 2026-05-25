@@ -112,6 +112,38 @@ func TestTUIHistory(t *testing.T) {
 	}
 }
 
+func TestTUIDrift(t *testing.T) {
+	m := newTUIModel()
+	apply := func(msg tea.Msg) { nm, _ := m.Update(msg); m = nm.(tuiModel) }
+	apply(tea.WindowSizeMsg{Width: 100, Height: 30})
+	apply(projectsMsg{projects: []ProjectView{
+		{Name: "app", Path: "/tmp/app", Envs: []string{"dev"}, ActiveEnv: "dev"},
+	}})
+	apply(tea.KeyMsg{Type: tea.KeyEnter}) // open
+	apply(driftMsg{report: &DriftReport{
+		Added:   []DriftItem{{Env: "base", Key: "NEW_KEY", Value: "secret-value"}},
+		Removed: []DriftItem{{Env: "base", Key: "OLD_KEY"}},
+	}})
+	if !strings.Contains(m.View(), "manual .env change") {
+		t.Fatalf("expected drift banner in browse view:\n%s", m.View())
+	}
+	apply(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("S")})
+	if m.mode != mDrift {
+		t.Fatal("S should open the drift view")
+	}
+	v := m.View()
+	if !strings.Contains(v, "NEW_KEY") || !strings.Contains(v, "OLD_KEY") {
+		t.Fatalf("drift view missing items:\n%s", v)
+	}
+	if strings.Contains(v, "secret-value") {
+		t.Fatal("drift view must mask values")
+	}
+	apply(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.mode != mBrowse {
+		t.Fatal("esc should dismiss the drift view")
+	}
+}
+
 func TestMask(t *testing.T) {
 	if got := mask(VarView{Value: "abcdefghijklmnop"}, false); strings.ContainsAny(got, "abc") {
 		t.Fatalf("masked value leaked content: %q", got)

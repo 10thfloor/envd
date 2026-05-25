@@ -1,9 +1,10 @@
 # envd — design spec
 
-Date: 2026-05-24 (kept current through v0.9, 2026-05-25)
-Status: v0.9 — local workflow complete and tested; a catalog of notable SaaS
-services (`envd add`); live references into many providers via their CLIs; hidden
-value entry + overwrite protection; remote platform sync deferred.
+Date: 2026-05-24 (kept current through v0.11, 2026-05-25)
+Status: v0.11 — local workflow complete and tested; one-command assimilation of
+existing `.env*` projects with `.env`-drift detection (`envd sync`); a catalog of
+notable SaaS services (`envd add`); live references into many providers via their
+CLIs; hidden value entry + overwrite protection; remote platform sync deferred.
 
 This document is append-only by version: the sections below the architecture
 record what each release added and why. For the current, complete command list
@@ -256,3 +257,55 @@ Comprehensive support for notable SaaS platforms and frameworks, framed as data.
 - **Tested:** `handleSet` overwrite/force/no-op logic and `handleImport` skip/force
   via in-memory daemon tests; end-to-end against a live daemon for the
   non-interactive paths and the connect guard.
+
+## v0.10 — `envd init` (2026-05-25)
+
+- Renamed project registration from `envd connect` to **`envd init`**, so it no
+  longer collides with `envd connect <provider>` (OAuth service connect). Bare
+  `envd connect` errors with a pointer to `envd init`.
+
+## v0.11 — assimilate existing projects (2026-05-25)
+
+- **`envd assimilate`** discovers a project's conventional dotenv files and ingests
+  them in one step. Discovery/classification (`classifyEnvFile`, `discoverEnv`) is
+  client-side (it reads cwd); the structured layers are sent to the daemon's
+  `handleAssimilate`, which auto-creates the project (or adopts an existing vault),
+  ensures the discovered environments exist, and writes values — preserving
+  existing ones unless `--force`.
+- **Mapping = standard dotenv precedence**, which lines up exactly with envd's
+  layers: `.env` and `.env.local` → `base` (`.local` wins); `.env.<mode>` and
+  `.env.<mode>.local` → that environment (`.local` wins); mode aliases normalized
+  (`development`→`dev`, `production`→`prod`, …). `hoistCommon` lifts values shared
+  by every mode into `base` and drops mode keys that merely duplicate base.
+  Template/non-value files (`.env.example`, `.env.sample`, `.env.vault`, …) skipped.
+- **Code-aware, not just file-aware:** assimilate also runs `scanEnvRefs` over the
+  source and fills referenced keys the `.env` files missed, via `resolveReferenced`
+  using heuristics in priority order: (1) the current shell environment (minus a
+  `systemEnvDeny` set so `PATH`/`HOME`/etc. are never tracked), (2) inline code
+  defaults from `discoverDefaults` (`process.env.X || "y"`, `os.getenv("X","y")`).
+  Anything still unknown is stored blank and reported as a warning. Heuristic
+  fills land in `base` (env-agnostic); `.env` values are never overwritten.
+  `scanEnvRefs`/`discoverDefaults` share a `walkSource` helper.
+- `Request.Layers map[string]map[string]string` carries env→KV (with `base`).
+  `handleRegister` was split into a lock-free `registerLocked` so assimilate can
+  reuse it while holding `d.mu`.
+- Also fixed `envd doctor --example` to write `.env.example` to the project root.
+- **Tested:** `classifyEnvFile`, `discoverEnv` (precedence + hoist + skip), and
+  `handleAssimilate`; plus end-to-end assimilation of a multi-file project.
+
+### Drift detection (`envd sync` + TUI)
+
+- `Vault.EnvBaseline` stores the `.env`-derived layers as of the last
+  assimilate/sync. `computeDrift(baseline, current)` produces added/changed/removed
+  `DriftItem`s; `handleDrift` reads the current `.env` files daemon-side
+  (`discoverEnvFiles(p.Path)`) and diffs. `handleApplyDrift` applies the diff
+  (set/unset with history) and advances the baseline.
+- **Designed to be un-surprising:** (1) the diff is always shown and never applied
+  without confirmation (`envd sync` y/N or the TUI `S` review → `a`); (2) the
+  baseline means vault-native keys (generated secrets, provider refs, `envd set`
+  values) are never proposed for removal — only keys that actually left the `.env`
+  files; (3) when there are no `.env` files at all (a fully-migrated project), drift
+  is empty, so deleting `.env` after assimilation never proposes wiping the vault;
+  (4) the baseline is established silently on first encounter for legacy projects.
+- Surfaced automatically: the TUI checks drift on project open and shows a banner;
+  `envd sync` is the CLI entry point.

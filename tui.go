@@ -38,6 +38,7 @@ const (
 	mConfirm
 	mDoctor
 	mHistory
+	mDrift
 )
 
 type tfocus int
@@ -82,7 +83,21 @@ type (
 		entries []HistoryEntry
 		err     string
 	}
+	driftMsg struct {
+		report *DriftReport
+		err    string
+	}
 )
+
+func runDriftCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		r, err := daemonCall(Request{Cmd: "drift", Args: map[string]string{"project": path}})
+		if err != nil {
+			return driftMsg{err: err.Error()}
+		}
+		return driftMsg{report: r.Drift}
+	}
+}
 
 func runHistoryCmd(path string) tea.Cmd {
 	return func() tea.Msg {
@@ -172,6 +187,7 @@ type tuiModel struct {
 	doc     *DoctorReport
 	hist    []HistoryEntry
 	histIdx int
+	drift   *DriftReport
 	// pending set awaiting overwrite confirmation
 	pendEnv, pendKey, pendVal string
 	status                    string
@@ -312,7 +328,7 @@ func (m *tuiModel) open(p *ProjectView) tea.Cmd {
 			m.envIdx = i
 		}
 	}
-	return loadVarsCmd(p.Path, m.curEnv(), m.reveal)
+	return tea.Batch(loadVarsCmd(p.Path, m.curEnv(), m.reveal), runDriftCmd(p.Path))
 }
 
 func (m *tuiModel) reloadVars() tea.Cmd {
@@ -405,6 +421,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = mHistory
 		return m, nil
 
+	case driftMsg:
+		if msg.err == "" {
+			m.drift = msg.report // banner shows in browse; user opens it with S
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		switch m.mode {
 		case mPicker:
@@ -420,6 +442,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case mHistory:
 			return m.updateHistory(msg)
+		case mDrift:
+			return m.updateDrift(msg)
 		}
 	}
 	return m, nil
@@ -470,6 +494,13 @@ func (m tuiModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "h":
 		m.histIdx = 0
 		return m, runHistoryCmd(m.proj.Path)
+	case "S":
+		if m.drift.empty() {
+			m.status = stDim.Render("no manual .env changes detected")
+			return m, nil
+		}
+		m.mode = mDrift
+		return m, nil
 	}
 
 	if m.focus == fEnvs {
@@ -588,6 +619,26 @@ func (m tuiModel) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m tuiModel) updateDrift(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "a", "A", "enter":
+		r, err := daemonCall(Request{Cmd: "applydrift", Args: map[string]string{"project": m.proj.Path}})
+		if err != nil {
+			m.status = stErr.Render("✗ " + err.Error())
+		} else if !r.OK {
+			m.status = stErr.Render("✗ " + r.Error)
+		} else {
+			m.status = stOK.Render("✓ " + r.Text)
+		}
+		m.drift = nil
+		m.mode = mBrowse
+		return m, tea.Batch(m.reloadVars(), loadProjectsCmd(), runDriftCmd(m.proj.Path))
+	default: // esc / any other key dismisses (keeps the banner)
+		m.mode = mBrowse
+		return m, nil
+	}
+}
+
 func (m tuiModel) View() string {
 	switch m.mode {
 	case mPicker:
@@ -596,9 +647,31 @@ func (m tuiModel) View() string {
 		return m.viewDoctor()
 	case mHistory:
 		return m.viewHistory()
+	case mDrift:
+		return m.viewDrift()
 	default:
 		return m.viewBrowse()
 	}
+}
+
+func (m tuiModel) viewDrift() string {
+	var b strings.Builder
+	b.WriteString(stHeader.Render(fmt.Sprintf("manual .env changes · %s", m.proj.Name)) + "\n\n")
+	b.WriteString(stDim.Render("Detected by comparing your .env files to the last sync. Applying updates the vault.\n\n"))
+	if m.drift.empty() {
+		b.WriteString("  (in sync)\n")
+	}
+	for _, it := range m.drift.Added {
+		b.WriteString(stOK.Render(fmt.Sprintf("  + %-22s %s  added\n", it.Env+"/"+it.Key, maskStr(it.Value))))
+	}
+	for _, it := range m.drift.Changed {
+		b.WriteString(stWarn.Render(fmt.Sprintf("  ~ %-22s %s  changed\n", it.Env+"/"+it.Key, maskStr(it.Value))))
+	}
+	for _, it := range m.drift.Removed {
+		b.WriteString(stErr.Render(fmt.Sprintf("  - %-22s     removed\n", it.Env+"/"+it.Key)))
+	}
+	b.WriteString("\n" + stDim.Render("a/enter apply to vault · esc dismiss (no change)"))
+	return b.String()
 }
 
 func (m tuiModel) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -720,6 +793,9 @@ func (m tuiModel) viewBrowse() string {
 		hdr += "  · revealed"
 	}
 	header := stHeader.Render(hdr)
+	if !m.drift.empty() {
+		header += "\n" + stWarn.Render(fmt.Sprintf("⚠ %d manual .env change(s) detected — press S to review & sync", m.drift.count()))
+	}
 
 	// env list
 	var el strings.Builder
@@ -777,9 +853,9 @@ func (m tuiModel) viewBrowse() string {
 	default:
 		var hints string
 		if m.focus == fEnvs {
-			hints = "tab→vars · ↑/↓ env · a set-active · A add-env · X del-env · r reveal · D doctor · h history · q quit"
+			hints = "tab→vars · ↑/↓ env · a set-active · A add-env · X del-env · r reveal · D doctor · h history · S sync · q quit"
 		} else {
-			hints = "tab→envs · ↑/↓ row · n new · e edit · d delete · r reveal · D doctor · h history · q quit"
+			hints = "tab→envs · ↑/↓ row · n new · e edit · d delete · r reveal · D doctor · h history · S sync · q quit"
 		}
 		footer = m.status
 		if footer != "" {

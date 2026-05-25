@@ -225,6 +225,228 @@ func TestImportSkipsExisting(t *testing.T) {
 	}
 }
 
+func TestDoctorExampleWritesToProjectRoot(t *testing.T) {
+	d, dir := newTestDaemon(t)
+	if err := os.WriteFile(filepath.Join(dir, "app.ts"), []byte("process.env.FOO; process.env.BAR"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := d.handleDoctor(Request{Cwd: dir, Args: map[string]string{"example": "true"}})
+	if !r.OK {
+		t.Fatalf("doctor failed: %s", r.Error)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, ".env.example"))
+	if err != nil {
+		t.Fatalf(".env.example not written to project root: %v", err)
+	}
+	for _, want := range []string{"BAR=", "FOO="} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf(".env.example missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+func TestClassifyEnvFile(t *testing.T) {
+	chk := func(name, env string, local, ok bool) {
+		t.Helper()
+		e, l, o := classifyEnvFile(name)
+		if e != env || l != local || o != ok {
+			t.Fatalf("%s → (%q,%v,%v), want (%q,%v,%v)", name, e, l, o, env, local, ok)
+		}
+	}
+	chk(".env", "base", false, true)
+	chk(".env.local", "base", true, true)
+	chk(".env.production", "prod", false, true)
+	chk(".env.production.local", "prod", true, true)
+	chk(".env.development", "dev", false, true)
+	chk(".env.staging", "staging", false, true)
+	chk(".env.test", "test", false, true)
+	chk(".env.ci", "ci", false, true)
+	chk(".env.example", "", false, false)
+	chk(".env.vault", "", false, false)
+	chk("config.js", "", false, false)
+}
+
+func TestDiscoverEnv(t *testing.T) {
+	dir := t.TempDir()
+	write := func(n, body string) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".env", "SHARED=base\nAPP=common\n")
+	write(".env.local", "SHARED=baselocal\n") // .local overrides base
+	write(".env.production", "APP=common\nDB=prod\n")
+	write(".env.production.local", "DB=prodlocal\n") // .local overrides prod
+	write(".env.development", "APP=common\nDB=dev\n")
+	write(".env.example", "IGNORED=x\n") // skipped
+
+	layers, used := discoverEnv(dir)
+	if layers["base"]["SHARED"] != "baselocal" {
+		t.Fatalf("base SHARED = %q (local should win)", layers["base"]["SHARED"])
+	}
+	if layers["base"]["APP"] != "common" {
+		t.Fatalf("base APP = %q", layers["base"]["APP"])
+	}
+	if _, ok := layers["prod"]["APP"]; ok {
+		t.Fatal("APP duplicates base — should be dropped from prod")
+	}
+	if layers["prod"]["DB"] != "prodlocal" {
+		t.Fatalf("prod DB = %q (.local should win)", layers["prod"]["DB"])
+	}
+	if layers["dev"]["DB"] != "dev" {
+		t.Fatalf("dev DB = %q", layers["dev"]["DB"])
+	}
+	if _, ok := layers["example"]; ok {
+		t.Fatal(".env.example must be skipped")
+	}
+	if len(used) != 5 {
+		t.Fatalf("used files = %v", used)
+	}
+}
+
+func TestDiscoverDefaults(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.ts"), []byte(
+		`const p = process.env.PORT || 3000;
+		 const h = process.env.HOST ?? "localhost";
+		 const l = process.env["LOG_LEVEL"] || 'info';`), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.py"), []byte(`os.getenv("RETRIES", "3")`), 0o644)
+	d := discoverDefaults(dir)
+	for k, want := range map[string]string{"PORT": "3000", "HOST": "localhost", "LOG_LEVEL": "info", "RETRIES": "3"} {
+		if d[k] != want {
+			t.Fatalf("default %s = %q, want %q (all: %v)", k, d[k], want, d)
+		}
+	}
+}
+
+func TestResolveReferenced(t *testing.T) {
+	layers := map[string]map[string]string{
+		"base": {"A": "1"},
+		"prod": {"B": "2"},
+	}
+	defaults := map[string]string{"D": "dd"}
+	env := map[string]string{"C": "from-shell"}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+
+	fromEnv, fromDefault, undet := resolveReferenced(layers, []string{"A", "B", "C", "D", "E"}, defaults, lookup)
+	if len(fromEnv) != 1 || fromEnv[0] != "C" || layers["base"]["C"] != "from-shell" {
+		t.Fatalf("C should be captured from env: %v / %q", fromEnv, layers["base"]["C"])
+	}
+	if len(fromDefault) != 1 || fromDefault[0] != "D" || layers["base"]["D"] != "dd" {
+		t.Fatalf("D should be captured from defaults: %v / %q", fromDefault, layers["base"]["D"])
+	}
+	if len(undet) != 1 || undet[0] != "E" {
+		t.Fatalf("E should be undetermined: %v", undet)
+	}
+	if v, ok := layers["base"]["E"]; !ok || v != "" {
+		t.Fatal("E should be stored as a blank placeholder")
+	}
+	if _, ok := layers["base"]["A"]; ok && layers["base"]["A"] != "1" {
+		t.Fatal("existing A must not be overwritten")
+	}
+}
+
+func TestAssimilate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // sandbox saveState
+	d, dir := newTestDaemon(t)
+	v := d.cache[dir].vault
+	r := d.handleAssimilate(Request{Cwd: dir, Layers: map[string]map[string]string{
+		"base": {"SHARED": "x"},
+		"prod": {"DB": "p"},
+	}})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	if v.Base["SHARED"] != "x" {
+		t.Fatalf("base SHARED = %q", v.Base["SHARED"])
+	}
+	if v.Values["prod"]["DB"] != "p" {
+		t.Fatalf("prod DB = %q", v.Values["prod"]["DB"])
+	}
+	found := false
+	for _, e := range v.Environments {
+		if e == "prod" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("prod should be added to environments: %v", v.Environments)
+	}
+}
+
+func TestComputeDrift(t *testing.T) {
+	base := map[string]map[string]string{
+		"base": {"SHARED": "1", "GONE": "x"},
+		"prod": {"DB": "old"},
+	}
+	cur := map[string]map[string]string{
+		"base": {"SHARED": "1", "NEW": "n"}, // NEW added, GONE removed
+		"prod": {"DB": "new"},               // DB changed
+	}
+	d := computeDrift(base, cur)
+	if d == nil {
+		t.Fatal("expected drift")
+	}
+	if len(d.Added) != 1 || d.Added[0].Key != "NEW" || d.Added[0].Value != "n" {
+		t.Fatalf("added = %+v", d.Added)
+	}
+	if len(d.Changed) != 1 || d.Changed[0].Key != "DB" || d.Changed[0].Value != "new" {
+		t.Fatalf("changed = %+v", d.Changed)
+	}
+	if len(d.Removed) != 1 || d.Removed[0].Key != "GONE" {
+		t.Fatalf("removed = %+v", d.Removed)
+	}
+	// identical → nil
+	if computeDrift(base, base) != nil {
+		t.Fatal("identical layers should report no drift")
+	}
+}
+
+func TestDriftDetectAndApply(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // sandbox saveState/saveVault baseline writes
+	d, dir := newTestDaemon(t)
+	write := func(n, body string) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// initial .env, assimilate-style baseline
+	write(".env", "A=1\nB=2\n")
+	d.cache[dir].vault.EnvBaseline = discoverEnvFiles(dir)
+	d.cache[dir].vault.Base["A"] = "1"
+	d.cache[dir].vault.Base["B"] = "2"
+
+	// user manually edits: A changed, B removed, C added
+	write(".env", "A=99\nC=3\n")
+
+	r := d.handleDrift(Request{Cwd: dir})
+	if r.Drift.empty() {
+		t.Fatal("expected drift after manual edit")
+	}
+	if r.Drift.count() != 3 {
+		t.Fatalf("expected 3 changes (A~ B- C+), got %+v", r.Drift)
+	}
+
+	ar := d.handleApplyDrift(Request{Cwd: dir})
+	if !ar.OK {
+		t.Fatal(ar.Error)
+	}
+	base := d.cache[dir].vault.Base
+	if base["A"] != "99" {
+		t.Fatalf("A should be updated to 99, got %q", base["A"])
+	}
+	if base["C"] != "3" {
+		t.Fatalf("C should be added, got %q", base["C"])
+	}
+	if _, ok := base["B"]; ok {
+		t.Fatal("B should be removed from the vault")
+	}
+	// after apply, no more drift
+	if r2 := d.handleDrift(Request{Cwd: dir}); !r2.Drift.empty() {
+		t.Fatalf("expected no drift after apply, got %+v", r2.Drift)
+	}
+}
+
 func TestParseDotenv(t *testing.T) {
 	kv := parseDotenv([]byte("A=1\nB=\"two words\"\n# comment\nexport C=3\n\nD=\nbad line\n"))
 	want := map[string]string{"A": "1", "B": "two words", "C": "3", "D": ""}
