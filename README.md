@@ -4,20 +4,24 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go Reference](https://pkg.go.dev/badge/github.com/10thfloor/envd.svg)](https://pkg.go.dev/github.com/10thfloor/envd)
 
-A daemon that makes switching local development between environments
-(`dev` / `staging` / `prod`) **obvious** and **automatic** — so you never handle
-or even *see* raw secret values.
+A daemon that manages **all** of a project's per-environment configuration — and
+injects it into your shell automatically as you switch between `dev` / `staging` /
+`prod`. Not just secrets: connection strings, API endpoints, feature flags, log
+levels, ports — anything your app reads from the environment.
 
-You reference `process.env.DATABASE_URL` in your code as normal. Whichever
-environment is active, `envd` injects the right value at process launch, straight
-into the environment — nothing written to disk, no value ever printed.
+You reference `process.env.DATABASE_URL` (or `LOG_LEVEL`, or `FEATURE_X`) in your
+code as normal. Whichever environment is active, `envd` fills it in at process
+launch — switch environments and every newly-launched process picks up the new
+config. Everything is stored encrypted; secret values are never printed, and
+ordinary settings ride the exact same rails.
 
-> **Status: v0.6 — usable, early.** The full local workflow is implemented and
-> tested: per-environment injection, layered environments, reference interpolation,
-> value generators, reflog-style history with rollback, a code-aware doctor,
-> zero-step onboarding, and an interactive TUI. The provider OAuth machinery is
-> built and tested, but no concrete vendor adapters ship yet (each needs its own
-> OAuth app). Remote platform sync (Fly/Cloudflare/Encore) is deferred.
+> **Status: v0.6 — usable, early.** It manages any static configuration — secrets
+> and plain settings alike. The full local workflow is implemented and tested:
+> per-environment injection, layered environments, reference interpolation, value
+> generators, reflog-style history with rollback, a code-aware doctor, zero-step
+> onboarding, and an interactive TUI. The provider OAuth machinery is built and
+> tested, but no concrete vendor adapters ship yet (each needs its own OAuth app).
+> Remote platform sync (Fly/Cloudflare/Encore) is deferred.
 >
 > The daemon core is pure Go stdlib; only the TUI pulls in third-party libraries
 > (Bubble Tea). Everything ships as one binary.
@@ -271,8 +275,9 @@ PROMPT='%~ ${ENVD_ENV:+(envd:$ENVD_ENV) }%# '
 
 ## Security
 
-- Secret values are encrypted at rest (AES-256-GCM) and only ever exist decrypted
-  in the daemon's memory and in the target process's environment.
+- All values are encrypted at rest (AES-256-GCM) — secrets are protected and plain
+  config rides along the same way — and only ever exist decrypted in the daemon's
+  memory and in the target process's environment.
 - The vault key is never committed: macOS Keychain by default, or a PBKDF2-derived
   key from `ENVD_PASSPHRASE` (600k iterations) for CI/Linux.
 - A wrong key fails closed: GCM authentication rejects it, the project shows as

@@ -1,6 +1,7 @@
-// envd — a single-file, dependency-free daemon that makes switching local
-// development between environments (dev/staging/prod) obvious and automatic,
-// so you never have to handle or see raw secret values.
+// envd — a daemon that manages all of a project's per-environment configuration
+// (secrets and ordinary settings alike) and injects it into your shell
+// automatically as you switch between dev/staging/prod. The daemon core is pure
+// Go stdlib; the TUI (tui.go) adds Bubble Tea. Everything ships as one binary.
 //
 // Design: docs/DESIGN.md
 //
@@ -2133,7 +2134,7 @@ func cmdStatus() {
 }
 
 func usage() {
-	fmt.Print(`envd ` + version + ` — never think about per-environment secrets again.
+	fmt.Print(`envd ` + version + ` — automatic per-environment configuration (secrets and settings).
 
 Usage:
   envd start                 Run the daemon (once per machine; backgroundable).

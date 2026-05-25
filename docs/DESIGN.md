@@ -10,11 +10,14 @@ see the [README](../README.md).
 
 ## Goal
 
-A daemon, started with a single command, that makes switching local development
-between environments (dev / staging / prod) **obvious** and **automatic**, so the
-developer **never has to handle or even see** the raw secret values. You reference
-`process.env.DATABASE_URL` as normal; whichever environment is active, the daemon
-fills it in at process launch.
+A daemon, started with a single command, that manages **all** of a project's
+per-environment configuration — secrets and ordinary settings alike — and makes
+switching between environments (dev / staging / prod) **obvious** and **automatic**.
+You reference `process.env.DATABASE_URL` (or `LOG_LEVEL`, a feature flag, a port…)
+as normal; whichever environment is active, the daemon fills it in at process
+launch. Secret values are additionally protected — encrypted at rest and never
+printed — but envd is the single source of truth for configuration of any kind,
+not only secrets.
 
 Originally specced as a single, dependency-free file. From v0.2 the TUI relaxed
 that (it uses Bubble Tea); the daemon core remains pure Go stdlib and the project

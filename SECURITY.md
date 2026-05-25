@@ -14,9 +14,14 @@ reproduce and the impact you observed.
 
 envd is honest about its boundaries. Read this before trusting it with anything.
 
+envd stores all of a project's configuration — secret and non-secret — and treats
+it all the same: everything in the vault is encrypted, so you don't have to mark
+which values are sensitive. The notes below are about how well that protects the
+sensitive ones.
+
 **What it protects:**
 
-- **Secrets at rest.** Each project's vault (`.envd/vault.json`) is encrypted with
+- **Config at rest.** Each project's vault (`.envd/vault.json`) is encrypted with
   AES-256-GCM and is safe to commit. The encryption key is never stored in the repo
   — it lives in the macOS Keychain, or is derived from `ENVD_PASSPHRASE` via PBKDF2.
 - **Plaintext sprawl.** Values are decrypted only in the daemon's memory and injected
