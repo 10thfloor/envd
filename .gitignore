@@ -1,0 +1,23 @@
+# Compiled binary (build with `go build -o envd .`)
+/envd
+envd.exe
+
+# Local env files — never commit plaintext secrets
+.env
+.env.*
+!.env.example
+
+# A stray dev/test vault created by running envd inside this source tree.
+# (Downstream users DO commit their own <project>/.envd/vault.json — this only
+#  keeps a local test vault out of envd's own repo.)
+.envd/
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Go
+*.test
+*.out
+coverage.txt
