@@ -1,8 +1,9 @@
 # envd — design spec
 
-Date: 2026-05-24 (kept current through v0.6, 2026-05-25)
-Status: v0.6 — local workflow complete and tested; provider OAuth machinery built
-(no vendor adapters ship yet); remote platform sync deferred.
+Date: 2026-05-24 (kept current through v0.8, 2026-05-25)
+Status: v0.8 — local workflow complete and tested; a catalog of notable SaaS
+services (`envd add`); live references into many providers via their CLIs; remote
+platform sync deferred.
 
 This document is append-only by version: the sections below the architecture
 record what each release added and why. For the current, complete command list
@@ -183,3 +184,54 @@ Completes the four-feature roadmap.
   `envd undo` (latest). TUI: `h` opens a history view, `enter`/`R` restores. New daemon commands
   `history` and `restore`.
 - Backward compatible: vaults without history start empty and accumulate it going forward.
+
+## v0.7 — provider references (2026-05-25)
+
+Generalizes the `op://` reference into a registry of industry-standard config/secret providers.
+
+- **Mechanism (chosen):** shell out to each vendor's official CLI rather than bundle SDKs or
+  build OAuth apps. This reuses the auth the user already has (`aws configure`, `gcloud auth`,
+  `doppler login`, `op signin`, …), keeps the daemon dependency-free, and is exactly how the
+  original `op://` worked. Each provider is one entry in `providerList` (`scheme`, required
+  `bin`, `fn(arg)`); `providerByScheme` indexes them.
+- **Schemes:** `op`, `vault`, `aws-sm`, `aws-ssm`, `gcp-sm`, `azure-kv`, `doppler`, `infisical`,
+  `pass`, `gopass`, plus dependency-free `env`, `file`, and a gated `cmd` (needs
+  `ENVD_ALLOW_EXEC=1` — it runs arbitrary shell, the others run a fixed binary with the ref as
+  arguments, so there's no shell-injection surface).
+- **Detection:** `schemeOf` + `looksLikeRef` recognize *known* schemes only, so a literal
+  `postgres://…` value is injected as-is and never mistaken for a reference.
+- **Performance/safety:** `Daemon.refCache` memoizes resolved refs for `refTTL` (60s) so
+  per-prompt injection doesn't shell out repeatedly. `ensurePATH` augments the daemon's PATH
+  (Homebrew, `/usr/local/bin`, `~/.local/bin`, `~/go/bin`) so CLIs are found under launchd.
+- **Surface:** `envd providers` lists schemes and per-CLI availability (checked in the daemon's
+  own PATH). The OAuth `Adapter` path is retained for future bulk-import adapters.
+- **Tested:** scheme detection, registry dispatch + TTL cache (fake provider), and a real CLI
+  shellout via a fake `op` on PATH; plus an end-to-end run resolving `env://`, `file://`, and an
+  embedded `${env://…}` through a live daemon.
+
+## v0.8 — service catalog (2026-05-25)
+
+Comprehensive support for notable SaaS platforms and frameworks, framed as data.
+
+- **Mechanism:** a static `catalog []catEntry` mapping each service (name, title,
+  category, docs URL, optional note, aliases) to the canonical env vars it expects
+  (`catVar{Key, Secret, Default}`). `catByName` indexes names + aliases. 100+ entries
+  across databases, auth, payments, email/SMS, AI & vector, backends & frameworks
+  (Meteor, Restate, Convex, Payload, Encore), platforms, observability, analytics,
+  CMS, search, jobs/queues, realtime, maps, and feature flags. `envd catalog` groups
+  by category at display time, so entries can be added in any order.
+- **`envd add <service>`** (`handleScaffold`): for each var, generate it when the
+  default is a `gen://…` (e.g. `BETTER_AUTH_SECRET`), apply a literal default when
+  given (callback URLs, `AWS_REGION`), else create an empty placeholder. Existing
+  keys are never overwritten. Every write is recorded in history. Returns a summary
+  (generated / defaults / fill-in + where to get them).
+- **`envd catalog [query]`** lists/searches the catalog grouped by category
+  (client-side; the catalog is baked into the binary).
+- **Why a catalog, not per-service APIs:** breadth without dependencies or bespoke
+  auth. Knowing the *names* is the high-value, comprehensive part; the *values*
+  come from `envd set`, a generator, or a provider reference (v0.7) — which compose
+  with scaffolded keys.
+- **Tested:** catalog integrity (no dup names, every var keyed, every `gen://`
+  default valid) + alias lookup; end-to-end scaffolding of betterauth (generated +
+  default), stripe (placeholders), an alias, and a note-only entry against a live
+  daemon.

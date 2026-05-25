@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -66,6 +68,95 @@ func TestOAuthFlow(t *testing.T) {
 
 	if _, err := runOAuthWith(context.Background(), OAuthConfig{}, func(string) {}); err == nil {
 		t.Fatal("missing client id should error")
+	}
+}
+
+func TestLooksLikeRef(t *testing.T) {
+	for _, s := range []string{"op://a/b", "envd://dev/X", "aws-ssm:///p", "vault://x#y", "doppler://NAME"} {
+		if !looksLikeRef(s) {
+			t.Fatalf("%q should be recognized as a reference", s)
+		}
+	}
+	// literals that merely look URL-ish must NOT be treated as references
+	for _, s := range []string{"postgres://u:p@h/db", "redis://h:6379", "https://example.com", "plain-value", ""} {
+		if looksLikeRef(s) {
+			t.Fatalf("%q should NOT be treated as a reference", s)
+		}
+	}
+}
+
+func TestResolveRefDispatchAndCache(t *testing.T) {
+	calls := 0
+	providerByScheme["test"] = provider{scheme: "test", fn: func(a string) (string, error) {
+		calls++
+		return "val:" + a, nil
+	}}
+	defer delete(providerByScheme, "test")
+
+	d := &Daemon{refCache: map[string]refCacheEntry{}}
+	if v, err := d.resolveRef(nil, "", "test://foo", 0); err != nil || v != "val:foo" {
+		t.Fatalf("dispatch: got %q, %v", v, err)
+	}
+	if v, _ := d.resolveRef(nil, "", "test://foo", 0); v != "val:foo" || calls != 1 {
+		t.Fatalf("expected cache hit (calls=1), got v=%q calls=%d", v, calls)
+	}
+	if _, err := d.resolveRef(nil, "", "nope://x", 0); err == nil {
+		t.Fatal("unknown scheme should error")
+	}
+}
+
+// TestProviderShellout verifies a provider resolver actually invokes the vendor
+// CLI, using a fake `op` on PATH (no real 1Password needed).
+func TestProviderShellout(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "op")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho \"resolved:$2\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	d := &Daemon{refCache: map[string]refCacheEntry{}}
+	v, err := d.resolveRef(nil, "", "op://Private/db/pw", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "resolved:op://Private/db/pw" {
+		t.Fatalf("shellout returned %q", v)
+	}
+}
+
+func TestCatalog(t *testing.T) {
+	if _, ok := catLookup("stripe"); !ok {
+		t.Fatal("stripe should be in the catalog")
+	}
+	if e, ok := catLookup("HF"); !ok || e.Name != "huggingface" {
+		t.Fatalf("alias HF should resolve to huggingface, got %q (%v)", e.Name, ok)
+	}
+	if _, ok := catLookup("definitely-not-a-service"); ok {
+		t.Fatal("unknown service should not resolve")
+	}
+	seen := map[string]bool{}
+	for _, e := range catalog {
+		if e.Name == "" || e.Title == "" || e.Cat == "" {
+			t.Fatalf("incomplete catalog entry: %+v", e)
+		}
+		if seen[e.Name] {
+			t.Fatalf("duplicate service name %q", e.Name)
+		}
+		seen[e.Name] = true
+		for _, v := range e.Vars {
+			if v.Key == "" {
+				t.Fatalf("%s has an empty var key", e.Name)
+			}
+			if strings.HasPrefix(v.Default, "gen://") {
+				if _, err := genValue(v.Default); err != nil {
+					t.Fatalf("%s/%s has an invalid generator %q: %v", e.Name, v.Key, v.Default, err)
+				}
+			}
+		}
+		if len(e.Vars) == 0 && e.Note == "" {
+			t.Fatalf("%s has neither vars nor a note", e.Name)
+		}
 	}
 }
 

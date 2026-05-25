@@ -6,6 +6,36 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-25
+
+### Added
+- **Service catalog** — built-in knowledge of 100+ notable SaaS platforms and
+  frameworks (Stripe, Neon, Supabase, Resend, Twilio, Hugging Face, Better Auth,
+  Clerk, OpenAI, Anthropic, Vercel, Cloudflare, Sentry, Meteor, Restate, Convex,
+  Langfuse, Mapbox, Sanity, Liveblocks, Temporal, …) and the canonical env vars
+  each expects, grouped across databases, auth, payments, email/SMS, AI, platforms,
+  backends/frameworks, observability, analytics, CMS, search, jobs, realtime, and more.
+  - `envd add <service> [--env e]` scaffolds a service's keys into an environment:
+    generates secrets (e.g. `BETTER_AUTH_SECRET`), applies sensible defaults (e.g.
+    `BETTER_AUTH_URL`), and leaves must-provide secrets blank with a link to where
+    to get them. Composes with provider references (fill via `op://`, `aws-sm://`…).
+  - `envd catalog [query]` lists/searches the catalog, grouped by category.
+- **Provider references for industry-standard config/secret sources.** Any value
+  can be a reference resolved live at inject time by shelling out to the vendor's
+  own CLI (reusing the auth you already have): `op://` (1Password), `vault://`
+  (HashiCorp Vault), `aws-sm://` / `aws-ssm://` (AWS Secrets Manager / SSM),
+  `gcp-sm://` (GCP Secret Manager), `azure-kv://` (Azure Key Vault), `doppler://`,
+  `infisical://`, `pass://`, `gopass://`, plus `env://`, `file://`, and a gated
+  `cmd://` escape hatch. Whole-value or embedded with `${…}`.
+  - `envd providers` lists every scheme and whether its CLI is installed.
+  - Resolved values are cached for 60s so per-prompt injection stays fast.
+  - The daemon augments its `PATH` so provider CLIs are found under launchd.
+
+### Changed
+- Reference resolution is now a data-driven registry; adding a provider is one
+  entry, no new dependency. `op://` migrated onto it. Literal URL-ish values
+  (e.g. `postgres://…`) are correctly left untouched — only known schemes resolve.
+
 ## [0.6.0] — 2026-05-25
 
 ### Added
@@ -63,7 +93,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AES-256-GCM), key in the macOS Keychain or via `ENVD_PASSPHRASE` (PBKDF2).
   Commands: `start`, `hook`, `connect`, `use`, `set`, `status`.
 
-[Unreleased]: https://github.com/10thfloor/envd/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/10thfloor/envd/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/10thfloor/envd/releases/tag/v0.8.0
 [0.6.0]: https://github.com/10thfloor/envd/releases/tag/v0.6.0
 [0.5.0]: https://github.com/10thfloor/envd/releases/tag/v0.5.0
 [0.4.0]: https://github.com/10thfloor/envd/releases/tag/v0.4.0

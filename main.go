@@ -43,7 +43,7 @@ import (
 
 const (
 	appName = "envd"
-	version = "0.6.0"
+	version = "0.8.0"
 )
 
 // ---------------------------------------------------------------------------
@@ -421,11 +421,33 @@ type session struct {
 	Last    time.Time
 }
 
+type refCacheEntry struct {
+	val string
+	exp time.Time
+}
+
 type Daemon struct {
 	mu       sync.Mutex
 	state    *State
-	cache    map[string]*unlocked // by project path
-	sessions map[string]session   // by shell id
+	cache    map[string]*unlocked     // by project path
+	sessions map[string]session       // by shell id
+	refCache map[string]refCacheEntry // resolved provider refs (TTL)
+}
+
+const refTTL = 60 * time.Second
+
+// refCacheGet/Set memoize external provider lookups so injection (which runs on
+// every shell prompt) doesn't shell out to AWS/Vault/etc. each time. Assumes d.mu.
+func (d *Daemon) refCacheGet(ref string) (string, bool) {
+	e, ok := d.refCache[ref]
+	if !ok || time.Now().After(e.exp) {
+		return "", false
+	}
+	return e.val, true
+}
+
+func (d *Daemon) refCacheSet(ref, val string) {
+	d.refCache[ref] = refCacheEntry{val: val, exp: time.Now().Add(refTTL)}
 }
 
 func loadState() *State {
@@ -528,16 +550,339 @@ func (d *Daemon) removeProjectByPath(path string) {
 }
 
 // ---------------------------------------------------------------------------
-// Reference interpolation (1Password-style): op://vault/item/field and
-// envd://<env>/<KEY>, usable whole-value or embedded via ${...}. Resolved at
-// inject time, recursively, with a depth cap for cycle protection.
+// Reference interpolation. A value may be a reference resolved at inject time
+// (recursively, depth-capped). `envd://<env>/<KEY>` reuses another env's value;
+// every other scheme is a provider that shells out to that vendor's official CLI
+// (reusing the auth you already have). Usable whole-value or embedded via ${...}.
 // ---------------------------------------------------------------------------
 
 var refRe = regexp.MustCompile(`\$\{([^}]+)\}`)
 
+// provider integrates an industry-standard config/secret source via its CLI.
+type provider struct {
+	scheme  string
+	bin     string // required CLI ("" = none / built-in)
+	desc    string
+	example string
+	fn      func(arg string) (string, error) // arg is everything after "scheme://"
+}
+
+// providerList is the registry of supported reference schemes. Adding a vendor is
+// a single entry here — no SDK, no OAuth app, no new dependency.
+var providerList = []provider{
+	{"op", "op", "1Password", "op://Private/db/password", func(a string) (string, error) {
+		return runCLI("op", "read", "op://"+a)
+	}},
+	{"vault", "vault", "HashiCorp Vault", "vault://secret/myapp#db_pass", func(a string) (string, error) {
+		path, field, ok := strings.Cut(a, "#")
+		if !ok || field == "" {
+			return "", errors.New("vault ref needs path#field")
+		}
+		return runCLI("vault", "kv", "get", "-field="+field, path)
+	}},
+	{"aws-sm", "aws", "AWS Secrets Manager", "aws-sm://myapp/prod#DB_URL", func(a string) (string, error) {
+		id, key, hasKey := strings.Cut(a, "#")
+		v, err := runCLI("aws", "secretsmanager", "get-secret-value", "--secret-id", id, "--query", "SecretString", "--output", "text")
+		if err != nil || !hasKey {
+			return v, err
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(v), &m); err != nil {
+			return "", fmt.Errorf("secret %q is not JSON: %v", id, err)
+		}
+		val, ok := m[key]
+		if !ok {
+			return "", fmt.Errorf("secret %q has no key %q", id, key)
+		}
+		return fmt.Sprint(val), nil
+	}},
+	{"aws-ssm", "aws", "AWS SSM Parameter Store", "aws-ssm:///myapp/prod/db_url", func(a string) (string, error) {
+		return runCLI("aws", "ssm", "get-parameter", "--name", a, "--with-decryption", "--query", "Parameter.Value", "--output", "text")
+	}},
+	{"gcp-sm", "gcloud", "GCP Secret Manager", "gcp-sm://my-project/db-url", func(a string) (string, error) {
+		proj, sec, ok := strings.Cut(a, "/")
+		if ok {
+			return runCLI("gcloud", "secrets", "versions", "access", "latest", "--secret="+sec, "--project="+proj)
+		}
+		return runCLI("gcloud", "secrets", "versions", "access", "latest", "--secret="+a)
+	}},
+	{"azure-kv", "az", "Azure Key Vault", "azure-kv://my-vault/db-url", func(a string) (string, error) {
+		vault, name, ok := strings.Cut(a, "/")
+		if !ok {
+			return "", errors.New("azure-kv ref needs vault/name")
+		}
+		return runCLI("az", "keyvault", "secret", "show", "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv")
+	}},
+	{"doppler", "doppler", "Doppler", "doppler://DATABASE_URL", func(a string) (string, error) {
+		if p := strings.Split(a, "/"); len(p) == 3 {
+			return runCLI("doppler", "secrets", "get", p[2], "--plain", "--project", p[0], "--config", p[1])
+		}
+		return runCLI("doppler", "secrets", "get", a, "--plain")
+	}},
+	{"infisical", "infisical", "Infisical", "infisical://prod/DATABASE_URL", func(a string) (string, error) {
+		env, name, ok := strings.Cut(a, "/")
+		if ok {
+			return runCLI("infisical", "secrets", "get", name, "--plain", "--env="+env)
+		}
+		return runCLI("infisical", "secrets", "get", a, "--plain")
+	}},
+	{"pass", "pass", "pass (password-store)", "pass://db/prod/url", func(a string) (string, error) {
+		out, err := runCLI("pass", "show", a)
+		if err != nil {
+			return "", err
+		}
+		line, _, _ := strings.Cut(out, "\n")
+		return line, nil
+	}},
+	{"gopass", "gopass", "gopass", "gopass://db/prod/url", func(a string) (string, error) {
+		return runCLI("gopass", "show", "-o", a)
+	}},
+	{"env", "", "Daemon environment var", "env://HOME_DB_URL", func(a string) (string, error) {
+		if v, ok := os.LookupEnv(a); ok {
+			return v, nil
+		}
+		return "", fmt.Errorf("$%s not set in the daemon's environment", a)
+	}},
+	{"file", "", "A file's contents", "file:///run/secrets/db_url", func(a string) (string, error) {
+		b, err := os.ReadFile(a)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}},
+	{"cmd", "", "Run a command (gated)", "cmd://my-tool get db-url", func(a string) (string, error) {
+		if os.Getenv("ENVD_ALLOW_EXEC") == "" {
+			return "", errors.New("cmd:// is disabled; set ENVD_ALLOW_EXEC=1 to enable")
+		}
+		return runCLI("sh", "-c", a)
+	}},
+}
+
+var providerByScheme = func() map[string]provider {
+	m := make(map[string]provider, len(providerList))
+	for _, p := range providerList {
+		m[p.scheme] = p
+	}
+	return m
+}()
+
+// runCLI runs a provider CLI and returns its trimmed stdout (stderr on error).
+func runCLI(bin string, args ...string) (string, error) {
+	out, err := exec.Command(bin, args...).Output()
+	if err != nil {
+		msg := err.Error()
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			msg = strings.TrimSpace(string(ee.Stderr))
+		}
+		return "", fmt.Errorf("%s: %s", bin, msg)
+	}
+	return strings.TrimRight(string(out), "\r\n"), nil
+}
+
+// schemeOf returns the URI scheme of s ("" if it isn't scheme://...).
+func schemeOf(s string) string {
+	i := strings.Index(s, "://")
+	if i <= 0 {
+		return ""
+	}
+	for _, r := range s[:i] {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '+' || r == '.') {
+			return ""
+		}
+	}
+	return s[:i]
+}
+
+// looksLikeRef reports whether s is a whole-value reference of a KNOWN scheme.
+// (A literal like postgres://… is not a known scheme, so it's left untouched.)
 func looksLikeRef(s string) bool {
-	s = strings.TrimSpace(s)
-	return strings.HasPrefix(s, "op://") || strings.HasPrefix(s, "envd://")
+	sc := schemeOf(strings.TrimSpace(s))
+	if sc == "envd" {
+		return true
+	}
+	_, ok := providerByScheme[sc]
+	return ok
+}
+
+// ---------------------------------------------------------------------------
+// Service catalog: which env vars each notable SaaS platform / framework expects.
+// `envd add <service>` scaffolds these keys (generating secrets, applying
+// sensible defaults, leaving must-provide secrets blank with a link). Pure data —
+// adding a service is one entry.
+// ---------------------------------------------------------------------------
+
+type catVar struct {
+	Key     string
+	Secret  bool
+	Default string // literal default, or gen://… to generate; "" = you must provide it
+}
+
+type catEntry struct {
+	Name, Title, Cat, URL, Note string
+	Aliases                     []string
+	Vars                        []catVar
+}
+
+var catalog = []catEntry{
+	// Databases & data
+	{Name: "neon", Title: "Neon", Cat: "Databases", URL: "https://console.neon.tech", Vars: []catVar{{"DATABASE_URL", true, ""}}},
+	{Name: "supabase", Title: "Supabase", Cat: "Databases", URL: "https://supabase.com/dashboard/project/_/settings/api", Vars: []catVar{{"SUPABASE_URL", false, ""}, {"SUPABASE_ANON_KEY", false, ""}, {"SUPABASE_SERVICE_ROLE_KEY", true, ""}}},
+	{Name: "planetscale", Title: "PlanetScale", Cat: "Databases", URL: "https://app.planetscale.com", Vars: []catVar{{"DATABASE_URL", true, ""}}},
+	{Name: "turso", Title: "Turso", Cat: "Databases", URL: "https://turso.tech/app", Vars: []catVar{{"TURSO_DATABASE_URL", false, ""}, {"TURSO_AUTH_TOKEN", true, ""}}},
+	{Name: "upstash", Title: "Upstash Redis", Cat: "Databases", URL: "https://console.upstash.com", Aliases: []string{"redis"}, Vars: []catVar{{"UPSTASH_REDIS_REST_URL", false, ""}, {"UPSTASH_REDIS_REST_TOKEN", true, ""}}},
+	{Name: "mongodb", Title: "MongoDB Atlas", Cat: "Databases", URL: "https://cloud.mongodb.com", Aliases: []string{"atlas"}, Vars: []catVar{{"MONGODB_URI", true, ""}}},
+
+	// Auth
+	{Name: "betterauth", Title: "Better Auth", Cat: "Auth", URL: "https://better-auth.com", Aliases: []string{"better-auth"}, Vars: []catVar{{"BETTER_AUTH_SECRET", true, "gen://random/32"}, {"BETTER_AUTH_URL", false, "http://localhost:3000"}}},
+	{Name: "authjs", Title: "Auth.js / NextAuth", Cat: "Auth", URL: "https://authjs.dev", Aliases: []string{"nextauth", "next-auth"}, Vars: []catVar{{"AUTH_SECRET", true, "gen://random/32"}, {"NEXTAUTH_URL", false, "http://localhost:3000"}}},
+	{Name: "clerk", Title: "Clerk", Cat: "Auth", URL: "https://dashboard.clerk.com", Vars: []catVar{{"CLERK_SECRET_KEY", true, ""}, {"NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", false, ""}}},
+	{Name: "auth0", Title: "Auth0", Cat: "Auth", URL: "https://manage.auth0.com", Vars: []catVar{{"AUTH0_SECRET", true, "gen://hex/32"}, {"AUTH0_BASE_URL", false, "http://localhost:3000"}, {"AUTH0_ISSUER_BASE_URL", false, ""}, {"AUTH0_CLIENT_ID", false, ""}, {"AUTH0_CLIENT_SECRET", true, ""}}},
+	{Name: "workos", Title: "WorkOS", Cat: "Auth", URL: "https://dashboard.workos.com", Vars: []catVar{{"WORKOS_API_KEY", true, ""}, {"WORKOS_CLIENT_ID", false, ""}}},
+	{Name: "stytch", Title: "Stytch", Cat: "Auth", URL: "https://stytch.com/dashboard", Vars: []catVar{{"STYTCH_PROJECT_ID", false, ""}, {"STYTCH_SECRET", true, ""}}},
+	{Name: "kinde", Title: "Kinde", Cat: "Auth", URL: "https://app.kinde.com", Vars: []catVar{{"KINDE_CLIENT_ID", false, ""}, {"KINDE_CLIENT_SECRET", true, ""}, {"KINDE_ISSUER_URL", false, ""}, {"KINDE_SITE_URL", false, "http://localhost:3000"}}},
+
+	// Payments
+	{Name: "stripe", Title: "Stripe", Cat: "Payments", URL: "https://dashboard.stripe.com/apikeys", Vars: []catVar{{"STRIPE_SECRET_KEY", true, ""}, {"STRIPE_PUBLISHABLE_KEY", false, ""}, {"STRIPE_WEBHOOK_SECRET", true, ""}}},
+	{Name: "paddle", Title: "Paddle", Cat: "Payments", URL: "https://vendors.paddle.com", Vars: []catVar{{"PADDLE_API_KEY", true, ""}, {"PADDLE_WEBHOOK_SECRET", true, ""}}},
+	{Name: "lemonsqueezy", Title: "Lemon Squeezy", Cat: "Payments", URL: "https://app.lemonsqueezy.com/settings/api", Aliases: []string{"lemon"}, Vars: []catVar{{"LEMONSQUEEZY_API_KEY", true, ""}, {"LEMONSQUEEZY_WEBHOOK_SECRET", true, ""}, {"LEMONSQUEEZY_STORE_ID", false, ""}}},
+
+	// Email & SMS
+	{Name: "resend", Title: "Resend", Cat: "Email & SMS", URL: "https://resend.com/api-keys", Vars: []catVar{{"RESEND_API_KEY", true, ""}}},
+	{Name: "sendgrid", Title: "SendGrid", Cat: "Email & SMS", URL: "https://app.sendgrid.com/settings/api_keys", Vars: []catVar{{"SENDGRID_API_KEY", true, ""}}},
+	{Name: "postmark", Title: "Postmark", Cat: "Email & SMS", URL: "https://account.postmarkapp.com", Vars: []catVar{{"POSTMARK_SERVER_TOKEN", true, ""}}},
+	{Name: "mailgun", Title: "Mailgun", Cat: "Email & SMS", URL: "https://app.mailgun.com", Vars: []catVar{{"MAILGUN_API_KEY", true, ""}, {"MAILGUN_DOMAIN", false, ""}}},
+	{Name: "twilio", Title: "Twilio", Cat: "Email & SMS", URL: "https://console.twilio.com", Vars: []catVar{{"TWILIO_ACCOUNT_SID", false, ""}, {"TWILIO_AUTH_TOKEN", true, ""}, {"TWILIO_PHONE_NUMBER", false, ""}}},
+	{Name: "loops", Title: "Loops", Cat: "Email & SMS", URL: "https://app.loops.so", Vars: []catVar{{"LOOPS_API_KEY", true, ""}}},
+
+	// AI / ML
+	{Name: "openai", Title: "OpenAI", Cat: "AI", URL: "https://platform.openai.com/api-keys", Vars: []catVar{{"OPENAI_API_KEY", true, ""}}},
+	{Name: "anthropic", Title: "Anthropic", Cat: "AI", URL: "https://console.anthropic.com/settings/keys", Aliases: []string{"claude"}, Vars: []catVar{{"ANTHROPIC_API_KEY", true, ""}}},
+	{Name: "huggingface", Title: "Hugging Face", Cat: "AI", URL: "https://huggingface.co/settings/tokens", Aliases: []string{"hf"}, Vars: []catVar{{"HF_TOKEN", true, ""}}},
+	{Name: "gemini", Title: "Google Generative AI", Cat: "AI", URL: "https://aistudio.google.com/apikey", Aliases: []string{"google-ai"}, Vars: []catVar{{"GEMINI_API_KEY", true, ""}}},
+	{Name: "groq", Title: "Groq", Cat: "AI", URL: "https://console.groq.com/keys", Vars: []catVar{{"GROQ_API_KEY", true, ""}}},
+	{Name: "mistral", Title: "Mistral", Cat: "AI", URL: "https://console.mistral.ai", Vars: []catVar{{"MISTRAL_API_KEY", true, ""}}},
+	{Name: "cohere", Title: "Cohere", Cat: "AI", URL: "https://dashboard.cohere.com/api-keys", Vars: []catVar{{"COHERE_API_KEY", true, ""}}},
+	{Name: "replicate", Title: "Replicate", Cat: "AI", URL: "https://replicate.com/account/api-tokens", Vars: []catVar{{"REPLICATE_API_TOKEN", true, ""}}},
+	{Name: "openrouter", Title: "OpenRouter", Cat: "AI", URL: "https://openrouter.ai/keys", Vars: []catVar{{"OPENROUTER_API_KEY", true, ""}}},
+	{Name: "perplexity", Title: "Perplexity", Cat: "AI", URL: "https://perplexity.ai", Vars: []catVar{{"PERPLEXITY_API_KEY", true, ""}}},
+	{Name: "elevenlabs", Title: "ElevenLabs", Cat: "AI", URL: "https://elevenlabs.io/app/settings/api-keys", Vars: []catVar{{"ELEVENLABS_API_KEY", true, ""}}},
+	{Name: "xai", Title: "xAI", Cat: "AI", URL: "https://console.x.ai", Aliases: []string{"grok"}, Vars: []catVar{{"XAI_API_KEY", true, ""}}},
+	{Name: "deepseek", Title: "DeepSeek", Cat: "AI", URL: "https://platform.deepseek.com", Vars: []catVar{{"DEEPSEEK_API_KEY", true, ""}}},
+	{Name: "together", Title: "Together AI", Cat: "AI", URL: "https://api.together.xyz/settings/api-keys", Vars: []catVar{{"TOGETHER_API_KEY", true, ""}}},
+	{Name: "fal", Title: "fal", Cat: "AI", URL: "https://fal.ai/dashboard/keys", Vars: []catVar{{"FAL_KEY", true, ""}}},
+
+	// Platforms & infra
+	{Name: "vercel", Title: "Vercel", Cat: "Platforms", URL: "https://vercel.com/account/tokens", Vars: []catVar{{"VERCEL_TOKEN", true, ""}, {"VERCEL_ORG_ID", false, ""}, {"VERCEL_PROJECT_ID", false, ""}}},
+	{Name: "cloudflare", Title: "Cloudflare", Cat: "Platforms", URL: "https://dash.cloudflare.com/profile/api-tokens", Vars: []catVar{{"CLOUDFLARE_API_TOKEN", true, ""}, {"CLOUDFLARE_ACCOUNT_ID", false, ""}}},
+	{Name: "fly", Title: "Fly.io", Cat: "Platforms", URL: "https://fly.io/user/personal_access_tokens", Vars: []catVar{{"FLY_API_TOKEN", true, ""}}},
+	{Name: "railway", Title: "Railway", Cat: "Platforms", URL: "https://railway.app/account/tokens", Vars: []catVar{{"RAILWAY_TOKEN", true, ""}}},
+	{Name: "aws", Title: "AWS", Cat: "Platforms", URL: "https://console.aws.amazon.com/iam", Vars: []catVar{{"AWS_ACCESS_KEY_ID", false, ""}, {"AWS_SECRET_ACCESS_KEY", true, ""}, {"AWS_REGION", false, "us-east-1"}}},
+	{Name: "github", Title: "GitHub (OAuth/API)", Cat: "Platforms", URL: "https://github.com/settings/developers", Vars: []catVar{{"GITHUB_CLIENT_ID", false, ""}, {"GITHUB_CLIENT_SECRET", true, ""}, {"GITHUB_TOKEN", true, ""}}},
+	{Name: "google-oauth", Title: "Google OAuth", Cat: "Platforms", URL: "https://console.cloud.google.com/apis/credentials", Vars: []catVar{{"GOOGLE_CLIENT_ID", false, ""}, {"GOOGLE_CLIENT_SECRET", true, ""}}},
+	{Name: "encore", Title: "Encore", Cat: "Platforms", URL: "https://encore.dev/docs/primitives/secrets", Note: "Encore manages secrets via `encore secret set` — no standard env vars to scaffold."},
+
+	// Observability & analytics
+	{Name: "sentry", Title: "Sentry", Cat: "Observability", URL: "https://sentry.io/settings/account/api/auth-tokens/", Vars: []catVar{{"SENTRY_DSN", false, ""}, {"SENTRY_AUTH_TOKEN", true, ""}}},
+	{Name: "posthog", Title: "PostHog", Cat: "Observability", URL: "https://app.posthog.com", Vars: []catVar{{"NEXT_PUBLIC_POSTHOG_KEY", false, ""}, {"NEXT_PUBLIC_POSTHOG_HOST", false, "https://us.i.posthog.com"}}},
+	{Name: "datadog", Title: "Datadog", Cat: "Observability", URL: "https://app.datadoghq.com/organization-settings/api-keys", Vars: []catVar{{"DD_API_KEY", true, ""}}},
+	{Name: "axiom", Title: "Axiom", Cat: "Observability", URL: "https://app.axiom.co", Vars: []catVar{{"AXIOM_TOKEN", true, ""}, {"AXIOM_ORG_ID", false, ""}}},
+
+	// Storage, search, jobs, realtime
+	{Name: "cloudinary", Title: "Cloudinary", Cat: "Storage & media", URL: "https://console.cloudinary.com", Vars: []catVar{{"CLOUDINARY_URL", true, ""}}},
+	{Name: "uploadthing", Title: "UploadThing", Cat: "Storage & media", URL: "https://uploadthing.com/dashboard", Vars: []catVar{{"UPLOADTHING_TOKEN", true, ""}}},
+	{Name: "algolia", Title: "Algolia", Cat: "Search", URL: "https://dashboard.algolia.com/account/api-keys", Vars: []catVar{{"ALGOLIA_APP_ID", false, ""}, {"ALGOLIA_API_KEY", true, ""}}},
+	{Name: "meilisearch", Title: "Meilisearch", Cat: "Search", URL: "https://meilisearch.com", Vars: []catVar{{"MEILI_MASTER_KEY", true, "gen://random/32"}, {"MEILI_HOST", false, "http://localhost:7700"}}},
+	{Name: "inngest", Title: "Inngest", Cat: "Jobs & queues", URL: "https://app.inngest.com", Vars: []catVar{{"INNGEST_EVENT_KEY", true, ""}, {"INNGEST_SIGNING_KEY", true, ""}}},
+	{Name: "trigger", Title: "Trigger.dev", Cat: "Jobs & queues", URL: "https://cloud.trigger.dev", Vars: []catVar{{"TRIGGER_SECRET_KEY", true, ""}}},
+	{Name: "pusher", Title: "Pusher", Cat: "Realtime", URL: "https://dashboard.pusher.com", Vars: []catVar{{"PUSHER_APP_ID", false, ""}, {"PUSHER_KEY", false, ""}, {"PUSHER_SECRET", true, ""}, {"PUSHER_CLUSTER", false, ""}}},
+	{Name: "ably", Title: "Ably", Cat: "Realtime", URL: "https://ably.com/accounts", Vars: []catVar{{"ABLY_API_KEY", true, ""}}},
+	{Name: "liveblocks", Title: "Liveblocks", Cat: "Realtime", URL: "https://liveblocks.io/dashboard", Vars: []catVar{{"LIVEBLOCKS_SECRET_KEY", true, ""}, {"NEXT_PUBLIC_LIVEBLOCKS_PUBLIC_KEY", false, ""}}},
+	{Name: "stream", Title: "Stream", Cat: "Realtime", URL: "https://getstream.io/dashboard", Vars: []catVar{{"STREAM_API_KEY", false, ""}, {"STREAM_API_SECRET", true, ""}}},
+	{Name: "knock", Title: "Knock", Cat: "Realtime", URL: "https://dashboard.knock.app", Vars: []catVar{{"KNOCK_API_KEY", true, ""}, {"NEXT_PUBLIC_KNOCK_PUBLIC_API_KEY", false, ""}}},
+
+	// Backends & frameworks
+	{Name: "meteor", Title: "Meteor", Cat: "Backends & frameworks", URL: "https://docs.meteor.com/api/meteor.html#environment", Aliases: []string{"galaxy"}, Vars: []catVar{{"MONGO_URL", true, ""}, {"ROOT_URL", false, "http://localhost:3000"}, {"MAIL_URL", true, ""}, {"METEOR_SETTINGS", true, ""}}},
+	{Name: "restate", Title: "Restate", Cat: "Backends & frameworks", URL: "https://docs.restate.dev", Vars: []catVar{{"RESTATE_ADMIN_URL", false, "http://localhost:9070"}, {"RESTATE_INGRESS_URL", false, "http://localhost:8080"}, {"RESTATE_API_KEY", true, ""}}},
+	{Name: "convex", Title: "Convex", Cat: "Backends & frameworks", URL: "https://dashboard.convex.dev", Vars: []catVar{{"CONVEX_DEPLOYMENT", false, ""}, {"CONVEX_DEPLOY_KEY", true, ""}, {"NEXT_PUBLIC_CONVEX_URL", false, ""}}},
+	{Name: "payload", Title: "Payload CMS", Cat: "Backends & frameworks", URL: "https://payloadcms.com", Vars: []catVar{{"PAYLOAD_SECRET", true, "gen://random/32"}, {"DATABASE_URI", true, ""}}},
+
+	// More databases
+	{Name: "firebase", Title: "Firebase", Cat: "Databases", URL: "https://console.firebase.google.com", Vars: []catVar{{"FIREBASE_PROJECT_ID", false, ""}, {"NEXT_PUBLIC_FIREBASE_API_KEY", false, ""}, {"FIREBASE_SERVICE_ACCOUNT_KEY", true, ""}}},
+	{Name: "appwrite", Title: "Appwrite", Cat: "Databases", URL: "https://cloud.appwrite.io", Vars: []catVar{{"APPWRITE_ENDPOINT", false, "https://cloud.appwrite.io/v1"}, {"APPWRITE_PROJECT_ID", false, ""}, {"APPWRITE_API_KEY", true, ""}}},
+	{Name: "xata", Title: "Xata", Cat: "Databases", URL: "https://app.xata.io", Vars: []catVar{{"XATA_API_KEY", true, ""}, {"XATA_BRANCH", false, "main"}}},
+	{Name: "redis", Title: "Redis", Cat: "Databases", URL: "https://redis.io", Vars: []catVar{{"REDIS_URL", true, "redis://localhost:6379"}}},
+
+	// More AI / vector
+	{Name: "langfuse", Title: "Langfuse", Cat: "AI", URL: "https://cloud.langfuse.com", Vars: []catVar{{"LANGFUSE_PUBLIC_KEY", false, ""}, {"LANGFUSE_SECRET_KEY", true, ""}, {"LANGFUSE_HOST", false, "https://cloud.langfuse.com"}}},
+	{Name: "langsmith", Title: "LangSmith", Cat: "AI", URL: "https://smith.langchain.com", Aliases: []string{"langchain"}, Vars: []catVar{{"LANGCHAIN_API_KEY", true, ""}, {"LANGCHAIN_TRACING_V2", false, "true"}, {"LANGCHAIN_ENDPOINT", false, "https://api.smith.langchain.com"}}},
+	{Name: "pinecone", Title: "Pinecone", Cat: "AI", URL: "https://app.pinecone.io", Vars: []catVar{{"PINECONE_API_KEY", true, ""}}},
+	{Name: "qdrant", Title: "Qdrant", Cat: "AI", URL: "https://cloud.qdrant.io", Vars: []catVar{{"QDRANT_URL", false, ""}, {"QDRANT_API_KEY", true, ""}}},
+	{Name: "weaviate", Title: "Weaviate", Cat: "AI", URL: "https://console.weaviate.cloud", Vars: []catVar{{"WEAVIATE_URL", false, ""}, {"WEAVIATE_API_KEY", true, ""}}},
+	{Name: "deepgram", Title: "Deepgram", Cat: "AI", URL: "https://console.deepgram.com", Vars: []catVar{{"DEEPGRAM_API_KEY", true, ""}}},
+	{Name: "assemblyai", Title: "AssemblyAI", Cat: "AI", URL: "https://www.assemblyai.com/app", Vars: []catVar{{"ASSEMBLYAI_API_KEY", true, ""}}},
+
+	// More payments
+	{Name: "polar", Title: "Polar", Cat: "Payments", URL: "https://polar.sh/settings", Vars: []catVar{{"POLAR_ACCESS_TOKEN", true, ""}, {"POLAR_WEBHOOK_SECRET", true, ""}}},
+	{Name: "square", Title: "Square", Cat: "Payments", URL: "https://developer.squareup.com/apps", Vars: []catVar{{"SQUARE_ACCESS_TOKEN", true, ""}, {"SQUARE_ENVIRONMENT", false, "sandbox"}}},
+	{Name: "razorpay", Title: "Razorpay", Cat: "Payments", URL: "https://dashboard.razorpay.com", Vars: []catVar{{"RAZORPAY_KEY_ID", false, ""}, {"RAZORPAY_KEY_SECRET", true, ""}}},
+
+	// More email / SMS
+	{Name: "plunk", Title: "Plunk", Cat: "Email & SMS", URL: "https://app.useplunk.com", Vars: []catVar{{"PLUNK_API_KEY", true, ""}}},
+	{Name: "courier", Title: "Courier", Cat: "Email & SMS", URL: "https://app.courier.com", Vars: []catVar{{"COURIER_AUTH_TOKEN", true, ""}}},
+
+	// CMS & content
+	{Name: "sanity", Title: "Sanity", Cat: "CMS & content", URL: "https://www.sanity.io/manage", Vars: []catVar{{"SANITY_PROJECT_ID", false, ""}, {"SANITY_DATASET", false, "production"}, {"SANITY_API_TOKEN", true, ""}}},
+	{Name: "contentful", Title: "Contentful", Cat: "CMS & content", URL: "https://app.contentful.com", Vars: []catVar{{"CONTENTFUL_SPACE_ID", false, ""}, {"CONTENTFUL_ACCESS_TOKEN", true, ""}}},
+	{Name: "storyblok", Title: "Storyblok", Cat: "CMS & content", URL: "https://app.storyblok.com", Vars: []catVar{{"STORYBLOK_TOKEN", true, ""}}},
+
+	// More storage / media
+	{Name: "r2", Title: "Cloudflare R2", Cat: "Storage & media", URL: "https://dash.cloudflare.com", Aliases: []string{"cloudflare-r2"}, Vars: []catVar{{"R2_ACCOUNT_ID", false, ""}, {"R2_ACCESS_KEY_ID", false, ""}, {"R2_SECRET_ACCESS_KEY", true, ""}, {"R2_BUCKET", false, ""}}},
+	{Name: "mux", Title: "Mux", Cat: "Storage & media", URL: "https://dashboard.mux.com", Vars: []catVar{{"MUX_TOKEN_ID", false, ""}, {"MUX_TOKEN_SECRET", true, ""}}},
+
+	// More observability
+	{Name: "honeycomb", Title: "Honeycomb", Cat: "Observability", URL: "https://ui.honeycomb.io", Vars: []catVar{{"HONEYCOMB_API_KEY", true, ""}}},
+	{Name: "betterstack", Title: "Better Stack", Cat: "Observability", URL: "https://betterstack.com", Aliases: []string{"logtail"}, Vars: []catVar{{"LOGTAIL_SOURCE_TOKEN", true, ""}}},
+	{Name: "newrelic", Title: "New Relic", Cat: "Observability", URL: "https://one.newrelic.com", Vars: []catVar{{"NEW_RELIC_LICENSE_KEY", true, ""}}},
+	{Name: "rollbar", Title: "Rollbar", Cat: "Observability", URL: "https://rollbar.com", Vars: []catVar{{"ROLLBAR_ACCESS_TOKEN", true, ""}}},
+	{Name: "otel", Title: "OpenTelemetry", Cat: "Observability", URL: "https://opentelemetry.io", Aliases: []string{"opentelemetry"}, Vars: []catVar{{"OTEL_EXPORTER_OTLP_ENDPOINT", false, ""}, {"OTEL_EXPORTER_OTLP_HEADERS", true, ""}}},
+
+	// Analytics
+	{Name: "segment", Title: "Segment", Cat: "Analytics", URL: "https://app.segment.com", Vars: []catVar{{"SEGMENT_WRITE_KEY", true, ""}}},
+	{Name: "mixpanel", Title: "Mixpanel", Cat: "Analytics", URL: "https://mixpanel.com", Vars: []catVar{{"MIXPANEL_TOKEN", true, ""}}},
+	{Name: "amplitude", Title: "Amplitude", Cat: "Analytics", URL: "https://amplitude.com", Vars: []catVar{{"AMPLITUDE_API_KEY", true, ""}}},
+
+	// Feature flags
+	{Name: "launchdarkly", Title: "LaunchDarkly", Cat: "Feature flags", URL: "https://app.launchdarkly.com", Vars: []catVar{{"LAUNCHDARKLY_SDK_KEY", true, ""}}},
+	{Name: "statsig", Title: "Statsig", Cat: "Feature flags", URL: "https://console.statsig.com", Vars: []catVar{{"STATSIG_SERVER_SECRET_KEY", true, ""}}},
+
+	// More search
+	{Name: "typesense", Title: "Typesense", Cat: "Search", URL: "https://cloud.typesense.org", Vars: []catVar{{"TYPESENSE_API_KEY", true, ""}, {"TYPESENSE_HOST", false, ""}}},
+	{Name: "elastic", Title: "Elasticsearch", Cat: "Search", URL: "https://cloud.elastic.co", Vars: []catVar{{"ELASTICSEARCH_URL", false, ""}, {"ELASTIC_API_KEY", true, ""}}},
+
+	// More jobs & queues
+	{Name: "qstash", Title: "Upstash QStash", Cat: "Jobs & queues", URL: "https://console.upstash.com/qstash", Vars: []catVar{{"QSTASH_TOKEN", true, ""}, {"QSTASH_URL", false, "https://qstash.upstash.io"}}},
+	{Name: "temporal", Title: "Temporal", Cat: "Jobs & queues", URL: "https://cloud.temporal.io", Vars: []catVar{{"TEMPORAL_ADDRESS", false, ""}, {"TEMPORAL_NAMESPACE", false, "default"}, {"TEMPORAL_API_KEY", true, ""}}},
+	{Name: "svix", Title: "Svix", Cat: "Jobs & queues", URL: "https://dashboard.svix.com", Vars: []catVar{{"SVIX_API_KEY", true, ""}}},
+
+	// Maps
+	{Name: "mapbox", Title: "Mapbox", Cat: "Maps", URL: "https://account.mapbox.com/access-tokens", Vars: []catVar{{"MAPBOX_ACCESS_TOKEN", false, ""}}},
+	{Name: "googlemaps", Title: "Google Maps", Cat: "Maps", URL: "https://console.cloud.google.com/google/maps-apis", Aliases: []string{"google-maps"}, Vars: []catVar{{"GOOGLE_MAPS_API_KEY", false, ""}}},
+}
+
+var catByName = func() map[string]catEntry {
+	m := make(map[string]catEntry)
+	for _, e := range catalog {
+		m[e.Name] = e
+		for _, a := range e.Aliases {
+			m[a] = e
+		}
+	}
+	return m
+}()
+
+func catLookup(s string) (catEntry, bool) {
+	e, ok := catByName[strings.ToLower(strings.TrimSpace(s))]
+	return e, ok
 }
 
 func hasRef(s string) bool { return looksLikeRef(s) || refRe.MatchString(s) }
@@ -568,8 +913,8 @@ func (d *Daemon) resolveValue(u *unlocked, env, value string, depth int) (string
 }
 
 func (d *Daemon) resolveRef(u *unlocked, env, ref string, depth int) (string, error) {
-	switch {
-	case strings.HasPrefix(ref, "envd://"):
+	// envd:// is internal (recurse into the vault), not a CLI provider.
+	if strings.HasPrefix(ref, "envd://") {
 		parts := strings.SplitN(strings.TrimPrefix(ref, "envd://"), "/", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return "", fmt.Errorf("bad reference %q (want envd://<env>/<KEY>)", ref)
@@ -584,10 +929,27 @@ func (d *Daemon) resolveRef(u *unlocked, env, ref string, depth int) (string, er
 			return "", fmt.Errorf("%s: unknown key %q", ref, rkey)
 		}
 		return d.resolveValue(u, renv, v, depth+1)
-	case strings.HasPrefix(ref, "op://"):
-		return opRead(ref)
 	}
-	return "", fmt.Errorf("unknown reference scheme %q", ref)
+
+	sc := schemeOf(ref)
+	p, ok := providerByScheme[sc]
+	if !ok {
+		return "", fmt.Errorf("unknown reference scheme in %q", ref)
+	}
+	if v, ok := d.refCacheGet(ref); ok { // avoid hammering the provider every prompt
+		return v, nil
+	}
+	if p.bin != "" {
+		if _, err := exec.LookPath(p.bin); err != nil {
+			return "", fmt.Errorf("%s:// needs the %q CLI on PATH", sc, p.bin)
+		}
+	}
+	v, err := p.fn(strings.TrimPrefix(ref, sc+"://"))
+	if err != nil {
+		return "", err
+	}
+	d.refCacheSet(ref, v)
+	return v, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -665,18 +1027,6 @@ func genUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-// opRead resolves a 1Password reference via the `op` CLI.
-func opRead(ref string) (string, error) {
-	if _, err := exec.LookPath("op"); err != nil {
-		return "", errors.New("1Password CLI `op` not found on PATH")
-	}
-	out, err := exec.Command("op", "read", ref).Output()
-	if err != nil {
-		return "", fmt.Errorf("op read %q failed (signed in?): %v", ref, err)
-	}
-	return strings.TrimRight(string(out), "\r\n"), nil
 }
 
 func (d *Daemon) handleExport(req Request) Response {
@@ -1481,6 +1831,105 @@ func (d *Daemon) handleRestore(req Request) Response {
 	return Response{OK: true, Text: text}
 }
 
+func (d *Daemon) handleScaffold(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findProjectByReq(req)
+	if p == nil {
+		return Response{Error: "no such project"}
+	}
+	u, err := d.getUnlocked(p)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	env := arg(req, "env")
+	if env == "" {
+		env = p.ActiveEnv
+	}
+	if env != "base" {
+		if _, ok := u.vault.Values[env]; !ok {
+			return Response{Error: "unknown env " + env}
+		}
+	}
+	e, ok := catLookup(arg(req, "service"))
+	if !ok {
+		return Response{Error: fmt.Sprintf("unknown service %q (run `envd catalog`)", arg(req, "service"))}
+	}
+
+	layer := u.layer(env)
+	var generated, defaults, todo, existing []string
+	for _, v := range e.Vars {
+		if _, ok := layer[v.Key]; ok {
+			existing = append(existing, v.Key)
+			continue
+		}
+		switch {
+		case strings.HasPrefix(v.Default, "gen://"):
+			val, gerr := genValue(v.Default)
+			if gerr != nil {
+				return Response{Error: gerr.Error()}
+			}
+			layer[v.Key] = val
+			u.record(HistoryEntry{Op: "set", Env: env, Key: v.Key, New: val})
+			generated = append(generated, v.Key)
+		case v.Default != "":
+			layer[v.Key] = v.Default
+			u.record(HistoryEntry{Op: "set", Env: env, Key: v.Key, New: v.Default})
+			defaults = append(defaults, v.Key)
+		default:
+			layer[v.Key] = "" // placeholder to fill (doctor flags empties)
+			u.record(HistoryEntry{Op: "set", Env: env, Key: v.Key, New: ""})
+			todo = append(todo, v.Key)
+		}
+	}
+	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
+		return Response{Error: err.Error()}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s → %s/%s\n", e.Title, p.Name, env)
+	if e.Note != "" {
+		fmt.Fprintf(&b, "  note:      %s\n", e.Note)
+	}
+	if len(generated) > 0 {
+		fmt.Fprintf(&b, "  generated: %s\n", strings.Join(generated, ", "))
+	}
+	if len(defaults) > 0 {
+		fmt.Fprintf(&b, "  defaults:  %s\n", strings.Join(defaults, ", "))
+	}
+	if len(todo) > 0 {
+		fmt.Fprintf(&b, "  fill in:   %s\n", strings.Join(todo, ", "))
+	}
+	if len(existing) > 0 {
+		fmt.Fprintf(&b, "  unchanged: %s (already set)\n", strings.Join(existing, ", "))
+	}
+	if e.URL != "" {
+		fmt.Fprintf(&b, "  keys at:   %s\n", e.URL)
+	}
+	if len(todo) > 0 {
+		fmt.Fprintf(&b, "  → fill one: cat key.txt | envd set %s --env %s   (or bind a ref, e.g. op://…)\n", todo[0], env)
+	}
+	return Response{OK: true, Text: b.String()}
+}
+
+func (d *Daemon) handleProviders() Response {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s reference providers (%d). Use as a value, or embed with ${…}:\n\n", appName, len(providerList))
+	fmt.Fprintf(&b, "  %-10s %-24s %-16s %s\n", "SCHEME", "SOURCE", "STATUS", "EXAMPLE")
+	for _, p := range providerList {
+		status := "ready"
+		if p.bin != "" {
+			if _, err := exec.LookPath(p.bin); err != nil {
+				status = "needs " + p.bin
+			}
+		}
+		fmt.Fprintf(&b, "  %-10s %-24s %-16s %s\n", p.scheme, p.desc, status, p.example)
+	}
+	fmt.Fprintf(&b, "  %-10s %-24s %-16s %s\n", "envd", "Another env (DRY)", "ready", "envd://base/API_BASE")
+	b.WriteString("\nProviders shell out to each vendor's CLI using the auth you already have.\n")
+	return Response{OK: true, Text: b.String()}
+}
+
 func (d *Daemon) serve(conn net.Conn) {
 	defer conn.Close()
 	var req Request
@@ -1525,13 +1974,40 @@ func (d *Daemon) serve(conn net.Conn) {
 		resp = d.handleHistory(req)
 	case "restore":
 		resp = d.handleRestore(req)
+	case "providers":
+		resp = d.handleProviders()
+	case "scaffold":
+		resp = d.handleScaffold(req)
 	default:
 		resp = Response{Error: "unknown cmd " + req.Cmd}
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
+// ensurePATH augments the daemon's PATH with common install locations so provider
+// CLIs (aws, gcloud, doppler, …) are found even under launchd's minimal PATH.
+func ensurePATH() {
+	cur := os.Getenv("PATH")
+	have := map[string]bool{}
+	for _, d := range strings.Split(cur, string(os.PathListSeparator)) {
+		have[d] = true
+	}
+	var add []string
+	for _, d := range []string{
+		"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+		filepath.Join(homeDir(), ".local", "bin"), filepath.Join(homeDir(), "go", "bin"),
+	} {
+		if !have[d] {
+			add = append(add, d)
+		}
+	}
+	if len(add) > 0 {
+		_ = os.Setenv("PATH", strings.Join(add, ":")+":"+cur)
+	}
+}
+
 func cmdStart() {
+	ensurePATH()
 	_ = os.MkdirAll(stateDir(), 0o700)
 	if _, err := os.Stat(socketPath()); err == nil {
 		if c, err := net.Dial("unix", socketPath()); err == nil {
@@ -1547,7 +2023,12 @@ func cmdStart() {
 	}
 	_ = os.Chmod(socketPath(), 0o600)
 
-	d := &Daemon{state: loadState(), cache: map[string]*unlocked{}, sessions: map[string]session{}}
+	d := &Daemon{
+		state:    loadState(),
+		cache:    map[string]*unlocked{},
+		sessions: map[string]session{},
+		refCache: map[string]refCacheEntry{},
+	}
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
@@ -2128,6 +2609,64 @@ func cmdUndo() {
 	fmt.Printf("✓ %s\n", resp.Text)
 }
 
+func cmdAdd(args []string) {
+	pos, flags := parseFlags(args)
+	if len(pos) < 1 {
+		fatalf("usage: envd add <service> [--env e]   (run `envd catalog` to see services)")
+	}
+	cwd, _ := os.Getwd()
+	resp := mustCall(Request{Cmd: "scaffold", Cwd: cwd,
+		Args: map[string]string{"service": pos[0], "env": flags["env"]}})
+	fmt.Print(resp.Text)
+}
+
+func cmdCatalog(args []string) {
+	pos, _ := parseFlags(args)
+	q := ""
+	if len(pos) > 0 {
+		q = strings.ToLower(pos[0])
+	}
+	var order []string
+	byCat := map[string][]catEntry{}
+	n := 0
+	for _, e := range catalog {
+		if q != "" {
+			hay := strings.ToLower(e.Name + " " + e.Title + " " + e.Cat)
+			for _, v := range e.Vars {
+				hay += " " + strings.ToLower(v.Key)
+			}
+			if !strings.Contains(hay, q) {
+				continue
+			}
+		}
+		if _, ok := byCat[e.Cat]; !ok {
+			order = append(order, e.Cat)
+		}
+		byCat[e.Cat] = append(byCat[e.Cat], e)
+		n++
+	}
+	for _, c := range order {
+		fmt.Printf("\n%s\n", c)
+		for _, e := range byCat[c] {
+			keys := make([]string, 0, len(e.Vars))
+			for _, v := range e.Vars {
+				keys = append(keys, v.Key)
+			}
+			detail := strings.Join(keys, ", ")
+			if detail == "" {
+				detail = e.Note
+			}
+			fmt.Printf("  %-14s %s\n", e.Name, detail)
+		}
+	}
+	fmt.Printf("\n%d services. Scaffold one with: envd add <name> [--env e]\n", n)
+}
+
+func cmdProviders() {
+	resp := mustCall(Request{Cmd: "providers"})
+	fmt.Print(resp.Text)
+}
+
 func cmdStatus() {
 	resp := mustCall(Request{Cmd: "status"})
 	fmt.Print(resp.Text)
@@ -2147,6 +2686,8 @@ Usage:
   envd env add <name>        Add a new environment (projects start with just 'dev').
   envd env rm <name>         Remove an environment.
   envd env ls                List this project's environments (* = active).
+  envd catalog [query]       List known SaaS services/frameworks and their env vars.
+  envd add <service> [--env e]  Scaffold a service's expected keys (e.g. stripe, neon).
   envd set <KEY> [--env e]   Store a value (read from stdin). --env base = shared layer.
   envd unset <KEY> [--env e] Delete a value.
   envd history [--env e] [--key K] [-n N]
@@ -2161,10 +2702,14 @@ Usage:
   envd status                Show projects, active envs, and active shells.
   envd version               Print version.
 
-References (resolved at inject time):
-  op://vault/item/field      Read live from 1Password (via the op CLI).
-  envd://<env>/<KEY>         Reuse another environment's value (DRY).
-  Embed either with ${...}:  postgres://app:${op://Private/db/pw}@host/db
+  envd providers             List supported config/secret providers (op, vault,
+                             aws-sm, gcp-sm, azure-kv, doppler, infisical, …).
+
+References (resolved live at inject time, whole-value or embedded with ${...}):
+  op://vault/item/field          1Password           envd://<env>/<KEY>   another env (DRY)
+  vault://path#field             HashiCorp Vault     aws-sm://id#key      AWS Secrets Manager
+  gcp-sm://project/secret        GCP Secret Manager  doppler://NAME       Doppler
+  Run 'envd providers' for the full list.  e.g.  DB=postgres://app:${op://Private/db/pw}@h/db
 
 Generators (materialized once, at set time):
   gen://random/32            Random bytes, base64. Also hex/N, uuid, password/N.
@@ -2224,6 +2769,12 @@ func main() {
 		cmdAdopt()
 	case "tui":
 		runTUI()
+	case "add":
+		cmdAdd(rest)
+	case "catalog", "services":
+		cmdCatalog(rest)
+	case "providers":
+		cmdProviders()
 	case "status", "ls", "list":
 		cmdStatus()
 	case "version", "--version", "-v":

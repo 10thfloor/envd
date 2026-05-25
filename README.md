@@ -15,13 +15,14 @@ launch — switch environments and every newly-launched process picks up the new
 config. Everything is stored encrypted; secret values are never printed, and
 ordinary settings ride the exact same rails.
 
-> **Status: v0.6 — usable, early.** It manages any static configuration — secrets
+> **Status: v0.8 — usable, early.** It manages any static configuration — secrets
 > and plain settings alike. The full local workflow is implemented and tested:
-> per-environment injection, layered environments, reference interpolation, value
-> generators, reflog-style history with rollback, a code-aware doctor, zero-step
-> onboarding, and an interactive TUI. The provider OAuth machinery is built and
-> tested, but no concrete vendor adapters ship yet (each needs its own OAuth app).
-> Remote platform sync (Fly/Cloudflare/Encore) is deferred.
+> per-environment injection, layered environments, reflog-style history with
+> rollback, a code-aware doctor, value generators, zero-step onboarding, an
+> interactive TUI, a **100+ service catalog** (`envd add stripe`, `neon`, …), and
+> **live references into 1Password, Vault, AWS, GCP, Azure, Doppler, Infisical, and
+> more** via their CLIs. Remote platform *sync* (pushing to Fly/Cloudflare/Encore)
+> is the main deferred piece.
 >
 > The daemon core is pure Go stdlib; only the TUI pulls in third-party libraries
 > (Bubble Tea). Everything ships as one binary.
@@ -103,6 +104,8 @@ envd use dev            # back to dev
 | `envd connect <provider>` | OAuth-connect a provider adapter and import its values. |
 | `envd use <env>` | Set the active environment for this project. |
 | `envd env add\|rm\|ls [name]` | Add, remove, or list environments. |
+| `envd catalog [query]` | List/search known SaaS services and their env vars. |
+| `envd add <service> [--env e]` | Scaffold a service's expected keys (e.g. `stripe`, `neon`). |
 | `envd set <KEY> [--env e]` | Store a value (read from stdin). `--env base` targets the shared layer. |
 | `envd unset <KEY> [--env e]` | Delete a value. |
 | `envd history [--env e] [--key K] [-n N]` | Show the project's change log (reflog). |
@@ -112,6 +115,7 @@ envd use dev            # back to dev
 | `envd doctor [--env e] [--example]` | Scan code for env-var refs; flag missing/empty/placeholder/unused. `--example` writes `.env.example`. |
 | `envd import [file] [--env e]` | Import a `.env` file (default `./.env`) into an environment. |
 | `envd adopt` | Register an existing on-disk vault (e.g. a freshly-cloned repo). |
+| `envd providers` | List supported provider reference schemes and CLI availability. |
 | `envd tui` | Open the interactive vault/environment manager. |
 | `envd status` | Show projects, active envs, var counts, and active shell sessions. |
 
@@ -157,26 +161,73 @@ running):
 
 Every edit goes through the daemon and is written straight to the encrypted vault.
 
-## References (1Password-style interpolation)
+## Service catalog (`envd add`)
 
-A stored value can be a *reference* that's resolved at inject time, so the real
-secret lives elsewhere and is never duplicated:
+envd ships a catalog of **100+ notable SaaS platforms and frameworks** and the
+canonical environment variables each one expects — so you don't have to look them
+up. `envd add <service>` scaffolds them into an environment:
 
-| Scheme | Resolves to |
-|---|---|
-| `op://vault/item/field` | A live read from 1Password via the `op` CLI. The secret never enters envd's vault. |
-| `envd://<env>/<KEY>` | Another environment's value in the same project (DRY). |
+```sh
+envd add betterauth     # generates BETTER_AUTH_SECRET, defaults BETTER_AUTH_URL
+envd add stripe         # creates STRIPE_SECRET_KEY / _PUBLISHABLE_KEY / _WEBHOOK_SECRET
+envd add neon supabase  # (run separately) DB connection strings + keys
+envd catalog ai         # search: openai, anthropic, huggingface, groq, mistral, …
+```
 
-Use either as the whole value, or embed with `${…}`:
+For each variable, `add` either **generates** it (auth secrets), fills a **sensible
+default** (callback URLs, regions), or leaves it **blank with a link** to where you
+get it (`envd doctor` then flags the blanks). Coverage spans databases (Neon,
+Supabase, PlanetScale, Turso, Upstash, Mongo, Firebase, Appwrite, Xata), auth
+(Better Auth, Auth.js, Clerk, Auth0, WorkOS, Stytch, Kinde), payments (Stripe,
+Paddle, Lemon Squeezy, Polar, Square), email/SMS (Resend, SendGrid, Postmark,
+Mailgun, Twilio, …), AI & vector (OpenAI, Anthropic, Hugging Face, Groq, Mistral,
+Gemini, Langfuse, Pinecone, Qdrant, …), backends & frameworks (Meteor, Restate,
+Convex, Payload, Encore), platforms (Vercel, Cloudflare, Fly, Railway, AWS,
+GitHub), observability/analytics (Sentry, PostHog, Datadog, Honeycomb, Segment,
+…), CMS (Sanity, Contentful, Storyblok), search, jobs/queues (Temporal, QStash,
+Inngest, Trigger.dev), realtime (Liveblocks, Stream, Pusher, Ably), maps (Mapbox,
+Google Maps), feature flags, and more. Run `envd catalog` for the full list.
+
+Scaffolded keys compose with references below — `envd add stripe`, then bind
+`STRIPE_SECRET_KEY` to `op://…` or `aws-sm://…` instead of pasting it.
+
+## References — pull from any provider
+
+A stored value can be a *reference* that's resolved live at inject time, so the
+real value lives in your existing secret manager and is never duplicated. Every
+scheme except `envd://` works by shelling out to that vendor's **own CLI**, reusing
+the auth you already have — no SDKs, no OAuth apps, no extra dependencies.
+
+| Scheme | Source | Example |
+|---|---|---|
+| `op://` | 1Password (`op`) | `op://Private/db/password` |
+| `vault://` | HashiCorp Vault (`vault`) | `vault://secret/myapp#db_pass` |
+| `aws-sm://` | AWS Secrets Manager (`aws`) | `aws-sm://myapp/prod#DB_URL` |
+| `aws-ssm://` | AWS SSM Parameter Store (`aws`) | `aws-ssm:///myapp/prod/db_url` |
+| `gcp-sm://` | GCP Secret Manager (`gcloud`) | `gcp-sm://my-project/db-url` |
+| `azure-kv://` | Azure Key Vault (`az`) | `azure-kv://my-vault/db-url` |
+| `doppler://` | Doppler (`doppler`) | `doppler://DATABASE_URL` |
+| `infisical://` | Infisical (`infisical`) | `infisical://prod/DATABASE_URL` |
+| `pass://` / `gopass://` | password-store / gopass | `pass://db/prod/url` |
+| `env://` | The daemon's own environment | `env://HOME_DB_URL` |
+| `file://` | A file's contents | `file:///run/secrets/db_url` |
+| `cmd://` | Run a command (needs `ENVD_ALLOW_EXEC=1`) | `cmd://my-tool get db-url` |
+| `envd://` | Another environment in this project (DRY) | `envd://base/API_BASE` |
+
+Run `envd providers` to see every scheme and whether its CLI is installed. Use a
+reference as the whole value, or embed with `${…}`:
 
 ```
 DATABASE_URL = postgres://app:${op://Private/db/password}@db.internal/app
-API_BASE     = envd://shared/API_BASE
+SENTRY_DSN   = aws-sm://myapp/prod#SENTRY_DSN
+API_BASE     = envd://base/API_BASE
 ```
 
-Resolution is recursive with cycle protection, and **fails closed**: a reference
-that can't be resolved (e.g. `op` not signed in) is simply omitted from the
-injected environment, and the TUI shows the error when you reveal it.
+Resolution is recursive with cycle protection, cached for 60s (so injecting on
+every shell prompt doesn't hammer the provider), and **fails closed**: a reference
+that can't be resolved (CLI missing, not signed in) is simply omitted from the
+injected environment, and the TUI surfaces the error when you reveal it. Literal
+URL-ish values like `postgres://…` are left untouched — only known schemes resolve.
 
 ### Generators (`gen://…`)
 
@@ -239,29 +290,28 @@ app/dev — scanned 37 file(s), 12 var(s) referenced
 - **Import:** `envd import .env` absorbs an existing dotenv file into an
   environment (`--env base` to put shared keys in the base layer).
 
-## Providers & custom adapters
+## Providers — two paths
 
-`envd connect <provider>` runs an OAuth authorization-code flow and pulls a
-provider's per-environment values straight into the vault — connect once, never
-paste a key. The flow (loopback callback + token exchange) is implemented and
-tested; **no concrete vendor adapters ship yet**, because each needs its own
-registered OAuth app and client ID.
-
-Adding one is small — implement the `Adapter` interface and register it in `init()`:
+**1. References (shipping, broad).** The [References](#references--pull-from-any-provider)
+table above is the primary integration: a value points at your existing secret
+manager, and envd resolves it live via that vendor's CLI. This covers 1Password,
+Vault, AWS, GCP, Azure, Doppler, Infisical, pass/gopass, and more today. Adding a
+provider is a single entry in `providerList` — no SDK, no OAuth app, no dependency:
 
 ```go
-type Adapter interface {
-    Name() string
-    OAuth() OAuthConfig
-    ListResources(ctx context.Context, accessToken string) ([]Resource, error)
-    FetchSecrets(ctx context.Context, accessToken, resourceID, envName string) (map[string]string, error)
-}
+{"doppler", "doppler", "Doppler", "doppler://NAME", func(arg string) (string, error) {
+    return runCLI("doppler", "secrets", "get", arg, "--plain")
+}},
 ```
 
-The generic OAuth runner (`runOAuth`) is provided; an adapter only supplies its
-endpoints, client ID, and the resource→secret mapping. New vendors are added
-in-source and recompiled — the daemon core stays dependency-free. The same shape
-will later grow a `PlatformAdapter` for the deferred deployment-sync side.
+**2. OAuth import (machinery, optional).** `envd connect <provider>` runs an OAuth
+authorization-code flow and pulls a provider's values *into* the vault in bulk. The
+flow (loopback callback + token exchange) is implemented and tested, but no concrete
+OAuth adapters ship — each needs its own registered OAuth app and client ID.
+Implement the `Adapter` interface (`Name` / `OAuth` / `ListResources` /
+`FetchSecrets`) and `registerAdapter` it; the generic `runOAuth` runner does the
+rest. The same shape will later grow a `PlatformAdapter` for the deferred
+deployment-sync side.
 
 ## Showing the active environment in your prompt
 
