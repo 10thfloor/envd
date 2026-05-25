@@ -160,6 +160,71 @@ func TestCatalog(t *testing.T) {
 	}
 }
 
+func newTestDaemon(t *testing.T) (*Daemon, string) {
+	t.Helper()
+	dir := t.TempDir()
+	v := &Vault{
+		Project: "p", Environments: []string{"dev"},
+		Base:   map[string]string{},
+		Values: map[string]map[string]string{"dev": {}},
+	}
+	return &Daemon{
+		state:    &State{Projects: []Project{{Name: "p", Path: dir, Envs: []string{"dev"}, ActiveEnv: "dev"}}},
+		cache:    map[string]*unlocked{dir: {vault: v, vf: &vaultFile{Version: 1, KDF: "pbkdf2"}, key: make([]byte, 32)}},
+		sessions: map[string]session{},
+		refCache: map[string]refCacheEntry{},
+	}, dir
+}
+
+func TestSetOverwriteGuard(t *testing.T) {
+	d, dir := newTestDaemon(t)
+	vals := d.cache[dir].vault.Values["dev"]
+	set := func(extra map[string]string) Response {
+		a := map[string]string{"key": "K", "env": "dev"}
+		for k, v := range extra {
+			a[k] = v
+		}
+		return d.handleSet(Request{Cwd: dir, Args: a})
+	}
+
+	if r := set(map[string]string{"value": "1"}); !r.OK {
+		t.Fatalf("first set should succeed: %+v", r)
+	}
+	if r := set(map[string]string{"value": "2"}); !r.NeedConfirm || r.OK {
+		t.Fatalf("overwrite should require confirmation: %+v", r)
+	}
+	if vals["K"] != "1" {
+		t.Fatalf("value must be unchanged when confirmation needed, got %q", vals["K"])
+	}
+	if r := set(map[string]string{"value": "1"}); r.NeedConfirm {
+		t.Fatal("setting the same value should not need confirmation")
+	}
+	if r := set(map[string]string{"value": "2", "force": "true"}); !r.OK || vals["K"] != "2" {
+		t.Fatalf("force should overwrite: %+v / %q", r, vals["K"])
+	}
+}
+
+func TestImportSkipsExisting(t *testing.T) {
+	d, dir := newTestDaemon(t)
+	vals := d.cache[dir].vault.Values["dev"]
+	d.handleSet(Request{Cwd: dir, Args: map[string]string{"key": "A", "env": "dev", "value": "1"}})
+
+	r := d.handleImport(Request{Cwd: dir, KV: map[string]string{"A": "x", "B": "y"}, Args: map[string]string{"env": "dev"}})
+	if !r.OK {
+		t.Fatal(r.Error)
+	}
+	if vals["A"] != "1" {
+		t.Fatalf("existing A should be skipped, got %q", vals["A"])
+	}
+	if vals["B"] != "y" {
+		t.Fatalf("new B should import, got %q", vals["B"])
+	}
+	d.handleImport(Request{Cwd: dir, KV: map[string]string{"A": "x"}, Args: map[string]string{"env": "dev", "force": "true"}})
+	if vals["A"] != "x" {
+		t.Fatalf("force should overwrite A, got %q", vals["A"])
+	}
+}
+
 func TestParseDotenv(t *testing.T) {
 	kv := parseDotenv([]byte("A=1\nB=\"two words\"\n# comment\nexport C=3\n\nD=\nbad line\n"))
 	want := map[string]string{"A": "1", "B": "two words", "C": "3", "D": ""}

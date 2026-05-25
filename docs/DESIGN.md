@@ -1,9 +1,9 @@
 # envd — design spec
 
-Date: 2026-05-24 (kept current through v0.8, 2026-05-25)
-Status: v0.8 — local workflow complete and tested; a catalog of notable SaaS
-services (`envd add`); live references into many providers via their CLIs; remote
-platform sync deferred.
+Date: 2026-05-24 (kept current through v0.9, 2026-05-25)
+Status: v0.9 — local workflow complete and tested; a catalog of notable SaaS
+services (`envd add`); live references into many providers via their CLIs; hidden
+value entry + overwrite protection; remote platform sync deferred.
 
 This document is append-only by version: the sections below the architecture
 record what each release added and why. For the current, complete command list
@@ -235,3 +235,22 @@ Comprehensive support for notable SaaS platforms and frameworks, framed as data.
   default valid) + alias lookup; end-to-end scaffolding of betterauth (generated +
   default), stripe (placeholders), an alias, and a note-only entry against a live
   daemon.
+
+## v0.9 — secure input & overwrite protection (2026-05-25)
+
+- **Hidden input (no echo):** `envd set` reads the value via a no-echo terminal
+  prompt (`golang.org/x/term`, already in the dependency graph via Bubble Tea),
+  or piped stdin when not a TTY. Removes the need for `echo …| envd set` while
+  keeping values out of shell history and argv. Isolated in `term.go` so the
+  daemon core stays stdlib-only.
+- **Overwrite protection:** `handleSet` returns `NeedConfirm` (without mutating)
+  when a value already exists and differs, unless `force` is set. The CLI prompts
+  y/N (or errors asking for `--force` when non-interactive); the TUI shows a
+  `cOverwrite` confirmation; `handleImport` skips existing keys unless forced. A
+  no-op set (same value) never prompts.
+- **connect guard:** `envd connect` refuses to silently re-key a directory that
+  already has a `.envd/vault.json` (which would abandon its values) — it confirms
+  first.
+- **Tested:** `handleSet` overwrite/force/no-op logic and `handleImport` skip/force
+  via in-memory daemon tests; end-to-end against a live daemon for the
+  non-interactive paths and the connect guard.

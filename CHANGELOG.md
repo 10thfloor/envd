@@ -6,6 +6,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-25
+
+### Added
+- **Hidden interactive prompt for `envd set`** — on a terminal it reads the value
+  with echo off (nothing in shell history or argv), so you no longer need
+  `echo …| envd set`. Piped stdin still works for scripts/CI.
+- **Overwrite protection.** `envd set` refuses to overwrite an existing value
+  unless you confirm (interactive y/N prompt, or `--force`; non-interactive
+  requires `--force`). The TUI prompts on overwrite too. `envd import` skips
+  existing keys unless `--force`. `envd connect` no longer silently clobbers a
+  directory's existing vault — it asks first.
+
+### Changed
+- `set` reading the same value it already holds is a no-op (no prompt).
+
 ## [0.8.0] — 2026-05-25
 
 ### Added
@@ -93,7 +108,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AES-256-GCM), key in the macOS Keychain or via `ENVD_PASSPHRASE` (PBKDF2).
   Commands: `start`, `hook`, `connect`, `use`, `set`, `status`.
 
-[Unreleased]: https://github.com/10thfloor/envd/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/10thfloor/envd/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/10thfloor/envd/releases/tag/v0.9.0
 [0.8.0]: https://github.com/10thfloor/envd/releases/tag/v0.8.0
 [0.6.0]: https://github.com/10thfloor/envd/releases/tag/v0.6.0
 [0.5.0]: https://github.com/10thfloor/envd/releases/tag/v0.5.0

@@ -18,8 +18,9 @@ CI runs all four on Linux and macOS for every PR.
 - **`main.go` is the dependency-free daemon core.** It uses only the Go standard
   library (crypto, sockets, HTTP, PBKDF2). Please keep it that way — no third-party
   imports in the core.
-- **`tui.go` is the only place third-party deps live** (Bubble Tea / Lipgloss /
-  Bubbles). Everything still ships as a single binary.
+- **Third-party deps live only in the UX-layer files:** `tui.go` (Bubble Tea /
+  Lipgloss / Bubbles) and `term.go` (`golang.org/x/term`, for hidden value entry).
+  Everything still ships as a single binary.
 - Tests: Bubble Tea models are pure functions — drive them via `Update`/`View`
   (see `tui_test.go`). Daemon/crypto/OAuth logic is unit-tested in `main_test.go`.
 

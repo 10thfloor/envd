@@ -61,6 +61,7 @@ type ckind int
 const (
 	cDelVar ckind = iota
 	cDelEnv
+	cOverwrite
 )
 
 type (
@@ -171,8 +172,37 @@ type tuiModel struct {
 	doc     *DoctorReport
 	hist    []HistoryEntry
 	histIdx int
-	status  string
-	w, h    int
+	// pending set awaiting overwrite confirmation
+	pendEnv, pendKey, pendVal string
+	status                    string
+	w, h                      int
+}
+
+// doSet writes a value via the daemon. If it would overwrite an existing value
+// and force is false, it stashes the pending set and asks for confirmation —
+// editing in the TUI prompts just like the CLI.
+func (m *tuiModel) doSet(env, key, val string, force bool) tea.Cmd {
+	args := map[string]string{"project": m.proj.Path, "env": env, "key": key, "value": val}
+	if force {
+		args["force"] = "true"
+	}
+	r, err := daemonCall(Request{Cmd: "set", Args: args})
+	switch {
+	case err != nil:
+		m.status = stErr.Render("✗ " + err.Error())
+		return nil
+	case r.NeedConfirm:
+		m.pendEnv, m.pendKey, m.pendVal = env, key, val
+		m.ck = cOverwrite
+		m.mode = mConfirm
+		return nil
+	case !r.OK:
+		m.status = stErr.Render("✗ " + r.Error)
+		return nil
+	default:
+		m.status = stOK.Render("✓ " + r.Text)
+		return tea.Batch(m.reloadVars(), loadProjectsCmd())
+	}
 }
 
 func newTUIModel() tuiModel {
@@ -521,9 +551,9 @@ func (m tuiModel) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.startPrompt(pNewVal, "value for "+val, "")
 			return m, textinput.Blink
 		case pNewVal:
-			return m, m.call(Request{Cmd: "set", Args: map[string]string{"env": m.curEnv(), "key": m.inCtx, "value": m.in.Value()}}, "set "+m.inCtx)
+			return m, m.doSet(m.curEnv(), m.inCtx, m.in.Value(), false)
 		case pEditVal:
-			return m, m.call(Request{Cmd: "set", Args: map[string]string{"env": m.curEnv(), "key": m.inCtx, "value": m.in.Value()}}, "updated "+m.inCtx)
+			return m, m.doSet(m.curEnv(), m.inCtx, m.in.Value(), false)
 		case pAddEnv:
 			if val == "" {
 				return m, nil
@@ -546,9 +576,14 @@ func (m tuiModel) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.call(Request{Cmd: "unset", Args: map[string]string{"env": m.curEnv(), "key": m.selKey()}}, "deleted "+m.selKey())
 		case cDelEnv:
 			return m, m.call(Request{Cmd: "rmenv", Args: map[string]string{"env": m.curEnv()}}, "removed env "+m.curEnv())
+		case cOverwrite:
+			return m, m.doSet(m.pendEnv, m.pendKey, m.pendVal, true)
 		}
 	default:
 		m.mode = mBrowse
+		if m.ck == cOverwrite {
+			m.status = stDim.Render("cancelled — " + m.pendKey + " unchanged")
+		}
 	}
 	return m, nil
 }
@@ -731,11 +766,14 @@ func (m tuiModel) viewBrowse() string {
 	case mPrompt:
 		footer = m.in.View()
 	case mConfirm:
-		what := m.selKey()
-		if m.ck == cDelEnv {
-			what = "environment " + m.curEnv()
+		switch m.ck {
+		case cOverwrite:
+			footer = stWarn.Render(m.pendKey + " is already set — overwrite? (y/n)")
+		case cDelEnv:
+			footer = stErr.Render("delete environment " + m.curEnv() + "?  (y/n)")
+		default:
+			footer = stErr.Render("delete " + m.selKey() + "?  (y/n)")
 		}
-		footer = stErr.Render("delete " + what + "?  (y/n)")
 	default:
 		var hints string
 		if m.focus == fEnvs {

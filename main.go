@@ -43,7 +43,7 @@ import (
 
 const (
 	appName = "envd"
-	version = "0.8.0"
+	version = "0.9.0"
 )
 
 // ---------------------------------------------------------------------------
@@ -304,16 +304,17 @@ type Request struct {
 }
 
 type Response struct {
-	OK       bool              `json:"ok"`
-	Error    string            `json:"error,omitempty"`
-	Exports  map[string]string `json:"exports,omitempty"`
-	Unsets   []string          `json:"unsets,omitempty"`
-	Env      string            `json:"env,omitempty"`
-	Text     string            `json:"text,omitempty"`
-	Projects []ProjectView     `json:"projects,omitempty"`
-	Vars     []VarView         `json:"vars,omitempty"`
-	Doctor   *DoctorReport     `json:"doctor,omitempty"`
-	History  []HistoryEntry    `json:"history,omitempty"`
+	OK          bool              `json:"ok"`
+	Error       string            `json:"error,omitempty"`
+	Exports     map[string]string `json:"exports,omitempty"`
+	Unsets      []string          `json:"unsets,omitempty"`
+	Env         string            `json:"env,omitempty"`
+	Text        string            `json:"text,omitempty"`
+	Projects    []ProjectView     `json:"projects,omitempty"`
+	Vars        []VarView         `json:"vars,omitempty"`
+	Doctor      *DoctorReport     `json:"doctor,omitempty"`
+	History     []HistoryEntry    `json:"history,omitempty"`
+	NeedConfirm bool              `json:"need_confirm,omitempty"` // mutation would overwrite; retry with force
 }
 
 // DoctorReport is the result of scanning project source for env-var references
@@ -1115,6 +1116,9 @@ func (d *Daemon) handleSet(req Request) Response {
 	key := arg(req, "key")
 	layer := u.layer(env)
 	old, had := layer[key]
+	if had && old != val && arg(req, "force") != "true" {
+		return Response{NeedConfirm: true, Text: fmt.Sprintf("%s is already set in %s/%s", key, p.Name, env)}
+	}
 	layer[key] = val
 	u.record(HistoryEntry{Op: "set", Env: env, Key: key, Old: old, HadOld: had, New: val})
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
@@ -1665,15 +1669,26 @@ func (d *Daemon) handleImport(req Request) Response {
 		}
 	}
 	layer := u.layer(env)
+	force := arg(req, "force") == "true"
+	imported, skipped := 0, 0
 	for k, v := range req.KV {
 		old, had := layer[k]
+		if had && old != v && !force {
+			skipped++
+			continue
+		}
 		layer[k] = v
 		u.record(HistoryEntry{Op: "set", Env: env, Key: k, Old: old, HadOld: had, New: v})
+		imported++
 	}
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
 		return Response{Error: err.Error()}
 	}
-	return Response{OK: true, Text: fmt.Sprintf("imported %d var(s) into %s/%s", len(req.KV), p.Name, env)}
+	text := fmt.Sprintf("imported %d var(s) into %s/%s", imported, p.Name, env)
+	if skipped > 0 {
+		text += fmt.Sprintf(" (skipped %d existing — pass --force to overwrite)", skipped)
+	}
+	return Response{OK: true, Text: text}
 }
 
 func (d *Daemon) handleAdopt(req Request) Response {
@@ -2324,6 +2339,14 @@ func cmdConnect(args []string) {
 
 func cmdConnectProject() {
 	cwd, _ := os.Getwd()
+	// Re-connecting clobbers an existing vault with a new key, abandoning its
+	// values — guard against doing that silently.
+	if _, err := os.Stat(vaultPath(cwd)); err == nil {
+		if !confirm("this directory already has an envd vault; re-connecting creates a NEW key and abandons its values — continue?") {
+			fmt.Fprintln(os.Stderr, "cancelled")
+			return
+		}
+	}
 	r := bufio.NewReader(os.Stdin)
 	name := prompt(r, "Project name", filepath.Base(cwd))
 	envs := prompt(r, "Environments (comma-separated)", "dev")
@@ -2386,14 +2409,36 @@ func cmdUse(args []string) {
 func cmdSet(args []string) {
 	pos, flags := parseFlags(args)
 	if len(pos) < 1 {
-		fatalf("usage: envd set <KEY> [--env ENV]   (value read from stdin)")
+		fatalf("usage: envd set <KEY> [--env ENV] [--force]")
 	}
-	fmt.Fprint(os.Stderr, "value (from stdin; pipe to avoid echo): ")
-	val, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	val = strings.TrimRight(val, "\r\n")
+	key := pos[0]
+	val := readValue("value for " + key) // hidden prompt on a TTY, else piped stdin
 	cwd, _ := os.Getwd()
-	resp := mustCall(Request{Cmd: "set", Cwd: cwd,
-		Args: map[string]string{"env": flags["env"], "key": pos[0], "value": val}})
+	a := map[string]string{"env": flags["env"], "key": key, "value": val}
+	if flags["force"] != "" || flags["f"] != "" {
+		a["force"] = "true"
+	}
+	resp, err := daemonCall(Request{Cmd: "set", Cwd: cwd, Args: a})
+	if err != nil {
+		fatal(err)
+	}
+	if resp.NeedConfirm {
+		if !stdinIsTTY() {
+			fatalf("%s — pass --force to overwrite", resp.Text)
+		}
+		if !confirm(resp.Text + " — overwrite?") {
+			fmt.Fprintln(os.Stderr, "cancelled")
+			return
+		}
+		a["force"] = "true"
+		resp, err = daemonCall(Request{Cmd: "set", Cwd: cwd, Args: a})
+		if err != nil {
+			fatal(err)
+		}
+	}
+	if !resp.OK {
+		fatalf("%s", resp.Error)
+	}
 	fmt.Printf("✓ %s\n", resp.Text)
 }
 
@@ -2478,7 +2523,11 @@ func cmdImport(args []string) {
 		fatalf("no variables found in %s", file)
 	}
 	cwd, _ := os.Getwd()
-	resp := mustCall(Request{Cmd: "import", Cwd: cwd, KV: kv, Args: map[string]string{"env": flags["env"]}})
+	a := map[string]string{"env": flags["env"]}
+	if flags["force"] != "" || flags["f"] != "" {
+		a["force"] = "true"
+	}
+	resp := mustCall(Request{Cmd: "import", Cwd: cwd, KV: kv, Args: a})
 	fmt.Printf("✓ %s\n", resp.Text)
 }
 
@@ -2681,14 +2730,18 @@ Usage:
   envd connect               Register the current directory as a project.
   envd connect <provider>    OAuth-connect a provider and import its values.
   envd adopt                 Register an existing on-disk vault (cloned repo).
-  envd import [file] [--env e]  Import a .env file (default ./.env) into an environment.
+  envd import [file] [--env e] [--force]
+                             Import a .env file (default ./.env). Skips existing keys
+                             unless --force.
   envd use <env>             Set the active environment for this project.
   envd env add <name>        Add a new environment (projects start with just 'dev').
   envd env rm <name>         Remove an environment.
   envd env ls                List this project's environments (* = active).
   envd catalog [query]       List known SaaS services/frameworks and their env vars.
   envd add <service> [--env e]  Scaffold a service's expected keys (e.g. stripe, neon).
-  envd set <KEY> [--env e]   Store a value (read from stdin). --env base = shared layer.
+  envd set <KEY> [--env e] [--force]
+                             Store a value — prompts hidden (no echo) on a terminal,
+                             or reads piped stdin. Overwrites prompt unless --force.
   envd unset <KEY> [--env e] Delete a value.
   envd history [--env e] [--key K] [-n N]
                              Show the change log (reflog) for this project.

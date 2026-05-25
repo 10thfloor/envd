@@ -84,9 +84,10 @@ envd env add staging
 envd env add prod
 envd env ls             # dev, staging, prod  (* marks the active one)
 
-# 5. Give them values (read from stdin — never in your shell history)
-cat db-dev-url.txt   | envd set DATABASE_URL --env dev
-cat db-stg-url.txt   | envd set DATABASE_URL --env staging
+# 5. Give them values — type at a hidden prompt (nothing in shell history),
+#    or pipe from a file/command for scripts
+envd set DATABASE_URL --env dev          # prompts: value for DATABASE_URL (hidden)
+cat db-stg-url.txt | envd set DATABASE_URL --env staging
 
 # 6. Switch environments — instantly reflected in new processes
 envd use staging        # your prompt shows (envd:staging via $ENVD_ENV)
@@ -106,7 +107,7 @@ envd use dev            # back to dev
 | `envd env add\|rm\|ls [name]` | Add, remove, or list environments. |
 | `envd catalog [query]` | List/search known SaaS services and their env vars. |
 | `envd add <service> [--env e]` | Scaffold a service's expected keys (e.g. `stripe`, `neon`). |
-| `envd set <KEY> [--env e]` | Store a value (read from stdin). `--env base` targets the shared layer. |
+| `envd set <KEY> [--env e] [--force]` | Store a value — hidden prompt on a terminal, or piped stdin. Prompts before overwriting. `--env base` = shared layer. |
 | `envd unset <KEY> [--env e]` | Delete a value. |
 | `envd history [--env e] [--key K] [-n N]` | Show the project's change log (reflog). |
 | `envd restore <seq>` | Roll back the change with that history seq. |
@@ -336,6 +337,10 @@ PROMPT='%~ ${ENVD_ENV:+(envd:$ENVD_ENV) }%# '
   all encrypted. This is a deliberate tradeoff — anyone with both the repo *and*
   the decryption key has the secrets, so guard Keychain access / the passphrase
   accordingly.
+- Values are entered via a **hidden prompt** (echo off) or piped stdin — never as a
+  command argument, so they don't land in shell history or the process table.
+  Overwrites require confirmation (or `--force`), so you can't clobber a value or a
+  project's vault by accident.
 
 envd is explicit about what it does **not** protect against, too. Read
 [`SECURITY.md`](SECURITY.md) before trusting it with real secrets, and report
