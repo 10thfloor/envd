@@ -43,7 +43,7 @@ import (
 
 const (
 	appName = "envd"
-	version = "0.9.0"
+	version = "0.10.0"
 )
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1072,7 @@ func (d *Daemon) handleUse(req Request) Response {
 	defer d.mu.Unlock()
 	p := d.findProjectByReq(req)
 	if p == nil {
-		return Response{Error: "no envd project here (run `envd connect`)"}
+		return Response{Error: "no envd project here (run `envd init`)"}
 	}
 	env := arg(req, "env")
 	found := false
@@ -1094,7 +1094,7 @@ func (d *Daemon) handleSet(req Request) Response {
 	defer d.mu.Unlock()
 	p := d.findProjectByReq(req)
 	if p == nil {
-		return Response{Error: "no envd project here (run `envd connect`)"}
+		return Response{Error: "no envd project here (run `envd init`)"}
 	}
 	u, err := d.getUnlocked(p)
 	if err != nil {
@@ -2327,14 +2327,14 @@ func cmdExport(args []string) {
 
 func cmdConnect(args []string) {
 	pos, _ := parseFlags(args)
-	if len(pos) > 0 {
-		if _, ok := adapters[pos[0]]; ok {
-			cmdConnectProvider(pos[0])
-			return
-		}
-		fatalf("unknown provider %q (registered: %s)", pos[0], strings.Join(adapterNames(), ", "))
+	if len(pos) == 0 {
+		fatalf("usage: envd connect <provider>  —  to register this directory as a project, use `envd init`")
 	}
-	cmdConnectProject()
+	if _, ok := adapters[pos[0]]; ok {
+		cmdConnectProvider(pos[0])
+		return
+	}
+	fatalf("unknown provider %q (registered: %s)", pos[0], strings.Join(adapterNames(), ", "))
 }
 
 func cmdConnectProject() {
@@ -2576,7 +2576,7 @@ func cmdEnv(args []string) {
 		resp := mustCall(Request{Cmd: "projects"})
 		p := pickProjectForCwd(resp.Projects, cwd)
 		if p == nil {
-			fatalf("no envd project here (run `envd connect`)")
+			fatalf("no envd project here (run `envd init`)")
 		}
 		for _, e := range p.Envs {
 			marker := "  "
@@ -2727,7 +2727,7 @@ func usage() {
 Usage:
   envd start                 Run the daemon (once per machine; backgroundable).
   envd hook <zsh|bash>       Print the shell hook to add to your rc file.
-  envd connect               Register the current directory as a project.
+  envd init                  Register the current directory as a project.
   envd connect <provider>    OAuth-connect a provider and import its values.
   envd adopt                 Register an existing on-disk vault (cloned repo).
   envd import [file] [--env e] [--force]
@@ -2771,7 +2771,7 @@ Generators (materialized once, at set time):
 Daily loop:
   1. envd start &                         # start the daemon
   2. eval "$(envd hook zsh)"  >> ~/.zshrc # one-time
-  3. cd my-app && envd connect            # register
+  3. cd my-app && envd init               # register
   4. cat secret.txt | envd set DATABASE_URL --env dev
   5. envd use staging                     # every new process now sees staging
 
@@ -2796,6 +2796,8 @@ func main() {
 		cmdHook(rest)
 	case "_export":
 		cmdExport(rest)
+	case "init":
+		cmdConnectProject()
 	case "connect":
 		cmdConnect(rest)
 	case "use":

@@ -55,7 +55,9 @@ still ships as one binary. Designed to extend to other framework/platform vendor
 
 - `envd start` — runs the daemon (unix socket `~/.envd/daemon.sock`).
 - `envd hook <zsh|bash>` — prints the shell hook to add to your rc file.
-- `envd connect` — register the current dir as a project (name, environments, key).
+- `envd init` — register the current dir as a project (name, environments, key).
+  (Was `envd connect` through v0.9; renamed in v0.10 to disambiguate from
+  `envd connect <provider>`.)
 - `envd connect <provider>` — OAuth-connect a provider adapter and import its values.
 - `envd use <env>` — set the active environment for the current project.
 - `envd set <KEY> [--env e]` — store a value (read from stdin so it never hits argv/history).
@@ -73,7 +75,7 @@ still ships as one binary. Designed to extend to other framework/platform vendor
 
 1. `envd start` (once per machine; backgroundable).
 2. `eval "$(envd hook zsh)"` in `~/.zshrc` (once).
-3. `cd` into a project → `envd connect` if unrecognized.
+3. `cd` into a project → `envd init` if unrecognized.
 4. `envd set` values, or `envd connect <provider>` to import them.
 5. `envd use staging` → prompt shows `(envd:staging)`; every newly-launched process
    inherits the staging values. Switch back with `envd use dev`.
@@ -248,9 +250,9 @@ Comprehensive support for notable SaaS platforms and frameworks, framed as data.
   y/N (or errors asking for `--force` when non-interactive); the TUI shows a
   `cOverwrite` confirmation; `handleImport` skips existing keys unless forced. A
   no-op set (same value) never prompts.
-- **connect guard:** `envd connect` refuses to silently re-key a directory that
-  already has a `.envd/vault.json` (which would abandon its values) — it confirms
-  first.
+- **init guard:** `envd init` (registration) refuses to silently re-key a directory
+  that already has a `.envd/vault.json` (which would abandon its values) — it
+  confirms first.
 - **Tested:** `handleSet` overwrite/force/no-op logic and `handleImport` skip/force
   via in-memory daemon tests; end-to-end against a live daemon for the
   non-interactive paths and the connect guard.

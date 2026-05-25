@@ -6,6 +6,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-05-25
+
+### Changed
+- **Renamed project registration to `envd init`** (was `envd connect`), so it no
+  longer collides with `envd connect <provider>` (OAuth service connect). Bare
+  `envd connect` now errors with a pointer to `envd init`.
+
 ## [0.9.0] — 2026-05-25
 
 ### Added
@@ -108,7 +115,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AES-256-GCM), key in the macOS Keychain or via `ENVD_PASSPHRASE` (PBKDF2).
   Commands: `start`, `hook`, `connect`, `use`, `set`, `status`.
 
-[Unreleased]: https://github.com/10thfloor/envd/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/10thfloor/envd/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/10thfloor/envd/releases/tag/v0.10.0
 [0.9.0]: https://github.com/10thfloor/envd/releases/tag/v0.9.0
 [0.8.0]: https://github.com/10thfloor/envd/releases/tag/v0.8.0
 [0.6.0]: https://github.com/10thfloor/envd/releases/tag/v0.6.0

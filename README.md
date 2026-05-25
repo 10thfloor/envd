@@ -77,7 +77,7 @@ exec zsh
 
 # 3. Register a project (starts with a single `dev` environment)
 cd ~/my-app
-envd connect            # asks for a name; environments default to just `dev`
+envd init               # asks for a name; environments default to just `dev`
 
 # 4. Add more environments whenever you need them
 envd env add staging
@@ -101,7 +101,7 @@ envd use dev            # back to dev
 |---|---|
 | `envd start` | Run the daemon (once per machine). |
 | `envd hook <zsh\|bash>` | Print the shell hook to add to your rc file. |
-| `envd connect` | Register the current directory as a project (starts with `dev`). |
+| `envd init` | Register the current directory as a project (starts with `dev`). |
 | `envd connect <provider>` | OAuth-connect a provider adapter and import its values. |
 | `envd use <env>` | Set the active environment for this project. |
 | `envd env add\|rm\|ls [name]` | Add, remove, or list environments. |
