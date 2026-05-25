@@ -12,7 +12,7 @@ You reference `process.env.DATABASE_URL` in your code as normal. Whichever
 environment is active, `envd` injects the right value at process launch, straight
 into the environment — nothing written to disk, no value ever printed.
 
-> Status: **v0.4**. Complete and tested: the env-switching core, an interactive
+> Status: **v0.5**. Complete and tested: the env-switching core, an interactive
 > **TUI** (`envd tui`), 1Password-style **reference interpolation**, **layered
 > environments** (`base` + overrides, `envd diff`), a **code-aware doctor**
 > (`envd doctor`), **zero-step onboarding** (`envd import` + auto-adopt on `cd`),
@@ -71,15 +71,20 @@ envd start &
 echo 'eval "$(envd hook zsh)"' >> ~/.zshrc   # or: envd hook bash
 exec zsh
 
-# 3. Register a project
+# 3. Register a project (starts with a single `dev` environment)
 cd ~/my-app
-envd connect            # asks for a name + environments (dev,staging,prod)
+envd connect            # asks for a name; environments default to just `dev`
 
-# 4. Give it values (read from stdin — never in your shell history)
+# 4. Add more environments whenever you need them
+envd env add staging
+envd env add prod
+envd env ls             # dev, staging, prod  (* marks the active one)
+
+# 5. Give them values (read from stdin — never in your shell history)
 cat db-dev-url.txt   | envd set DATABASE_URL --env dev
 cat db-stg-url.txt   | envd set DATABASE_URL --env staging
 
-# 5. Switch environments — instantly reflected in new processes
+# 6. Switch environments — instantly reflected in new processes
 envd use staging        # your prompt shows (envd:staging via $ENVD_ENV)
 npm run dev             # sees the staging DATABASE_URL
 envd use dev            # back to dev
@@ -91,9 +96,10 @@ envd use dev            # back to dev
 |---|---|
 | `envd start` | Run the daemon (once per machine). |
 | `envd hook <zsh\|bash>` | Print the shell hook to add to your rc file. |
-| `envd connect` | Register the current directory as a project. |
+| `envd connect` | Register the current directory as a project (starts with `dev`). |
 | `envd connect <provider>` | OAuth-connect a provider adapter and import its values. |
 | `envd use <env>` | Set the active environment for this project. |
+| `envd env add\|rm\|ls [name]` | Add, remove, or list environments. |
 | `envd set <KEY> [--env e]` | Store a value (read from stdin). `--env base` targets the shared layer. |
 | `envd unset <KEY> [--env e]` | Delete a value. |
 | `envd diff <envA> <envB>` | Show which keys differ between two environments (values masked). |

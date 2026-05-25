@@ -6,6 +6,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-25
+
+### Added
+- `envd env add|rm|ls` — manage environments from the CLI (previously TUI-only).
+
+### Changed
+- New projects now start with a single `dev` environment instead of
+  `dev,staging,prod`. Add more with `envd env add <name>` (or the TUI `A` key).
+  You can still pass a custom comma-separated list at `envd connect` time.
+
 ## [0.4.0] — 2026-05-25
 
 ### Added
@@ -42,7 +52,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AES-256-GCM), key in the macOS Keychain or via `ENVD_PASSPHRASE` (PBKDF2).
   Commands: `start`, `hook`, `connect`, `use`, `set`, `status`.
 
-[Unreleased]: https://github.com/10thfloor/envd/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/10thfloor/envd/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/10thfloor/envd/releases/tag/v0.5.0
 [0.4.0]: https://github.com/10thfloor/envd/releases/tag/v0.4.0
 [0.3.0]: https://github.com/10thfloor/envd/releases/tag/v0.3.0
 [0.2.0]: https://github.com/10thfloor/envd/releases/tag/v0.2.0

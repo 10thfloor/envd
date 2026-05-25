@@ -42,7 +42,7 @@ import (
 
 const (
 	appName = "envd"
-	version = "0.4.0"
+	version = "0.5.0"
 )
 
 // ---------------------------------------------------------------------------
@@ -1657,7 +1657,7 @@ func cmdConnectProject() {
 	cwd, _ := os.Getwd()
 	r := bufio.NewReader(os.Stdin)
 	name := prompt(r, "Project name", filepath.Base(cwd))
-	envs := prompt(r, "Environments (comma-separated)", "dev,staging,prod")
+	envs := prompt(r, "Environments (comma-separated)", "dev")
 
 	kdf := "keychain"
 	if os.Getenv("ENVD_PASSPHRASE") != "" {
@@ -1671,8 +1671,8 @@ func cmdConnectProject() {
 	fmt.Printf("✓ %s\n", resp.Text)
 	fmt.Print("\nNext:\n" +
 		"  1. Shell hook (once):  add  eval \"$(envd hook zsh)\"  to ~/.zshrc\n" +
-		"  2. Set a value:        cat secret.txt | envd set DATABASE_URL --env dev\n" +
-		"  3. Switch env:         envd use staging\n")
+		"  2. Set a value:        cat secret.txt | envd set DATABASE_URL\n" +
+		"  3. Add an environment: envd env add staging\n")
 }
 
 func cmdConnectProvider(name string) {
@@ -1819,6 +1819,59 @@ func cmdAdopt() {
 	fmt.Printf("✓ %s\n", resp.Text)
 }
 
+func pickProjectForCwd(ps []ProjectView, cwd string) *ProjectView {
+	cwd = filepath.Clean(cwd)
+	var best *ProjectView
+	bestLen := -1
+	for i := range ps {
+		pp := filepath.Clean(ps[i].Path)
+		if cwd == pp || strings.HasPrefix(cwd, pp+string(filepath.Separator)) {
+			if len(pp) > bestLen {
+				best, bestLen = &ps[i], len(pp)
+			}
+		}
+	}
+	return best
+}
+
+func cmdEnv(args []string) {
+	pos, _ := parseFlags(args)
+	cwd, _ := os.Getwd()
+	sub := ""
+	if len(pos) > 0 {
+		sub = pos[0]
+	}
+	switch sub {
+	case "add":
+		if len(pos) < 2 {
+			fatalf("usage: envd env add <name>")
+		}
+		resp := mustCall(Request{Cmd: "addenv", Cwd: cwd, Args: map[string]string{"env": pos[1]}})
+		fmt.Printf("✓ %s\n", resp.Text)
+	case "rm", "remove":
+		if len(pos) < 2 {
+			fatalf("usage: envd env rm <name>")
+		}
+		resp := mustCall(Request{Cmd: "rmenv", Cwd: cwd, Args: map[string]string{"env": pos[1]}})
+		fmt.Printf("✓ %s\n", resp.Text)
+	case "ls", "list", "":
+		resp := mustCall(Request{Cmd: "projects"})
+		p := pickProjectForCwd(resp.Projects, cwd)
+		if p == nil {
+			fatalf("no envd project here (run `envd connect`)")
+		}
+		for _, e := range p.Envs {
+			marker := "  "
+			if e == p.ActiveEnv {
+				marker = "* "
+			}
+			fmt.Printf("%s%s\n", marker, e)
+		}
+	default:
+		fatalf("usage: envd env <add|rm|ls> [name]")
+	}
+}
+
 func cmdStatus() {
 	resp := mustCall(Request{Cmd: "status"})
 	fmt.Print(resp.Text)
@@ -1835,6 +1888,9 @@ Usage:
   envd adopt                 Register an existing on-disk vault (cloned repo).
   envd import [file] [--env e]  Import a .env file (default ./.env) into an environment.
   envd use <env>             Set the active environment for this project.
+  envd env add <name>        Add a new environment (projects start with just 'dev').
+  envd env rm <name>         Remove an environment.
+  envd env ls                List this project's environments (* = active).
   envd set <KEY> [--env e]   Store a value (read from stdin). --env base = shared layer.
   envd unset <KEY> [--env e] Delete a value.
   envd diff <envA> <envB>    Show which keys differ between two environments.
@@ -1886,6 +1942,8 @@ func main() {
 		cmdConnect(rest)
 	case "use":
 		cmdUse(rest)
+	case "env":
+		cmdEnv(rest)
 	case "set":
 		cmdSet(rest)
 	case "unset":
