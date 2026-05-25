@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-25
+
+### Added
+- **Reflog-like history**: every mutation (set/unset/import/addenv/rmenv) is
+  recorded per project with the prior state.
+  - `envd history [--env e] [--key K] [-n N]` shows the change log (values masked).
+  - `envd restore <seq>` rolls back a value change, or restores a removed
+    environment (with its contents). `envd undo` reverts the most recent change.
+  - Restores are themselves recorded, so they're re-undoable.
+  - In the TUI, press `h` to browse history and `enter`/`R` to restore.
+
 ## [0.5.0] — 2026-05-25
 
 ### Added
@@ -52,7 +63,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AES-256-GCM), key in the macOS Keychain or via `ENVD_PASSPHRASE` (PBKDF2).
   Commands: `start`, `hook`, `connect`, `use`, `set`, `status`.
 
-[Unreleased]: https://github.com/10thfloor/envd/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/10thfloor/envd/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/10thfloor/envd/releases/tag/v0.6.0
 [0.5.0]: https://github.com/10thfloor/envd/releases/tag/v0.5.0
 [0.4.0]: https://github.com/10thfloor/envd/releases/tag/v0.4.0
 [0.3.0]: https://github.com/10thfloor/envd/releases/tag/v0.3.0

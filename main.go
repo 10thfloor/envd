@@ -42,7 +42,7 @@ import (
 
 const (
 	appName = "envd"
-	version = "0.5.0"
+	version = "0.6.0"
 )
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,25 @@ type Vault struct {
 	Base         map[string]string            `json:"base"`      // shared layer, inherited by every env
 	Values       map[string]map[string]string `json:"values"`    // env -> KEY -> value (overrides base)
 	Providers    map[string]ProviderState     `json:"providers"` // provider name -> token/bindings
+	History      []HistoryEntry               `json:"history,omitempty"`
+	NextSeq      int                          `json:"next_seq,omitempty"`
 }
+
+// HistoryEntry is one recorded mutation (reflog-like). It carries the prior
+// state needed to undo it.
+type HistoryEntry struct {
+	Seq      int               `json:"seq"`
+	Time     time.Time         `json:"time"`
+	Op       string            `json:"op"` // set | unset | addenv | rmenv
+	Env      string            `json:"env"`
+	Key      string            `json:"key,omitempty"`
+	Old      string            `json:"old,omitempty"`
+	New      string            `json:"new,omitempty"`
+	HadOld   bool              `json:"had_old,omitempty"`  // key existed before a set
+	Snapshot map[string]string `json:"snapshot,omitempty"` // removed env's contents (rmenv)
+}
+
+const historyCap = 500
 
 type ProviderState struct {
 	Token    json.RawMessage            `json:"token,omitempty"`
@@ -294,6 +312,7 @@ type Response struct {
 	Projects []ProjectView     `json:"projects,omitempty"`
 	Vars     []VarView         `json:"vars,omitempty"`
 	Doctor   *DoctorReport     `json:"doctor,omitempty"`
+	History  []HistoryEntry    `json:"history,omitempty"`
 }
 
 // DoctorReport is the result of scanning project source for env-var references
@@ -368,6 +387,18 @@ func (u *unlocked) layer(env string) map[string]string {
 		u.vault.Values[env] = map[string]string{}
 	}
 	return u.vault.Values[env]
+}
+
+// record appends a mutation to the project's reflog, assigning a monotonic Seq
+// and capping the log length.
+func (u *unlocked) record(e HistoryEntry) {
+	u.vault.NextSeq++
+	e.Seq = u.vault.NextSeq
+	e.Time = time.Now().UTC()
+	u.vault.History = append(u.vault.History, e)
+	if len(u.vault.History) > historyCap {
+		u.vault.History = u.vault.History[len(u.vault.History)-historyCap:]
+	}
 }
 
 // effective merges the base layer with env's own values (env wins).
@@ -730,11 +761,15 @@ func (d *Daemon) handleSet(req Request) Response {
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
-	u.layer(env)[arg(req, "key")] = val
+	key := arg(req, "key")
+	layer := u.layer(env)
+	old, had := layer[key]
+	layer[key] = val
+	u.record(HistoryEntry{Op: "set", Env: env, Key: key, Old: old, HadOld: had, New: val})
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
 		return Response{Error: err.Error()}
 	}
-	return Response{OK: true, Text: fmt.Sprintf("set %s for %s/%s", arg(req, "key"), p.Name, env)}
+	return Response{OK: true, Text: fmt.Sprintf("set %s for %s/%s", key, p.Name, env)}
 }
 
 func (d *Daemon) handleRegister(req Request) Response {
@@ -959,10 +994,12 @@ func (d *Daemon) handleUnset(req Request) Response {
 		return Response{Error: "unknown env " + env}
 	}
 	key := arg(req, "key")
-	if _, ok := m[key]; !ok {
+	old, ok := m[key]
+	if !ok {
 		return Response{Error: "no such key " + key + " in " + env}
 	}
 	delete(m, key)
+	u.record(HistoryEntry{Op: "unset", Env: env, Key: key, Old: old, HadOld: true})
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -993,6 +1030,7 @@ func (d *Daemon) handleAddEnv(req Request) Response {
 	u.vault.Values[env] = map[string]string{}
 	u.vault.Environments = append(u.vault.Environments, env)
 	p.Envs = append(p.Envs, env)
+	u.record(HistoryEntry{Op: "addenv", Env: env})
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -1018,12 +1056,17 @@ func (d *Daemon) handleRmEnv(req Request) Response {
 	if len(p.Envs) <= 1 {
 		return Response{Error: "cannot remove the last environment"}
 	}
+	snap := make(map[string]string, len(u.vault.Values[env]))
+	for k, v := range u.vault.Values[env] {
+		snap[k] = v
+	}
 	delete(u.vault.Values, env)
 	u.vault.Environments = removeStr(u.vault.Environments, env)
 	p.Envs = removeStr(p.Envs, env)
 	if p.ActiveEnv == env {
 		p.ActiveEnv = p.Envs[0]
 	}
+	u.record(HistoryEntry{Op: "rmenv", Env: env, Snapshot: snap})
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -1272,7 +1315,9 @@ func (d *Daemon) handleImport(req Request) Response {
 	}
 	layer := u.layer(env)
 	for k, v := range req.KV {
+		old, had := layer[k]
 		layer[k] = v
+		u.record(HistoryEntry{Op: "set", Env: env, Key: k, Old: old, HadOld: had, New: v})
 	}
 	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
 		return Response{Error: err.Error()}
@@ -1295,6 +1340,144 @@ func (d *Daemon) handleAdopt(req Request) Response {
 		return Response{Error: err.Error()}
 	}
 	return Response{OK: true, Text: msg}
+}
+
+func cloneMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (d *Daemon) handleHistory(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findProjectByReq(req)
+	if p == nil {
+		return Response{Error: "no such project"}
+	}
+	u, err := d.getUnlocked(p)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	fEnv, fKey := arg(req, "env"), arg(req, "key")
+	limit := 50
+	if n, e := strconv.Atoi(arg(req, "n")); e == nil && n > 0 {
+		limit = n
+	}
+	var out []HistoryEntry
+	for i := len(u.vault.History) - 1; i >= 0; i-- { // newest first
+		e := u.vault.History[i]
+		if fEnv != "" && e.Env != fEnv {
+			continue
+		}
+		if fKey != "" && e.Key != fKey {
+			continue
+		}
+		out = append(out, e)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return Response{OK: true, History: out}
+}
+
+// handleRestore applies the inverse of a recorded mutation, recording the
+// reversion itself so it's also undoable (reflog-like).
+func (d *Daemon) handleRestore(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findProjectByReq(req)
+	if p == nil {
+		return Response{Error: "no such project"}
+	}
+	u, err := d.getUnlocked(p)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	if len(u.vault.History) == 0 {
+		return Response{Error: "no history yet"}
+	}
+
+	var target HistoryEntry // copy before any record() reallocates the slice
+	if s := arg(req, "seq"); s == "" || s == "latest" {
+		target = u.vault.History[len(u.vault.History)-1]
+	} else {
+		seq, err := strconv.Atoi(s)
+		if err != nil {
+			return Response{Error: "bad seq " + s}
+		}
+		found := false
+		for _, e := range u.vault.History {
+			if e.Seq == seq {
+				target, found = e, true
+				break
+			}
+		}
+		if !found {
+			return Response{Error: fmt.Sprintf("no history entry #%s (it may have aged out)", s)}
+		}
+	}
+
+	structural := false
+	var text string
+	switch target.Op {
+	case "set":
+		layer := u.layer(target.Env)
+		cur, hadCur := layer[target.Key]
+		if target.HadOld {
+			layer[target.Key] = target.Old
+			u.record(HistoryEntry{Op: "set", Env: target.Env, Key: target.Key, Old: cur, HadOld: hadCur, New: target.Old})
+		} else {
+			delete(layer, target.Key)
+			u.record(HistoryEntry{Op: "unset", Env: target.Env, Key: target.Key, Old: cur, HadOld: hadCur})
+		}
+		text = fmt.Sprintf("restored %s/%s to its value before #%d", target.Env, target.Key, target.Seq)
+	case "unset":
+		layer := u.layer(target.Env)
+		cur, hadCur := layer[target.Key]
+		layer[target.Key] = target.Old
+		u.record(HistoryEntry{Op: "set", Env: target.Env, Key: target.Key, Old: cur, HadOld: hadCur, New: target.Old})
+		text = fmt.Sprintf("restored %s/%s (undeleted)", target.Env, target.Key)
+	case "addenv":
+		if _, ok := u.vault.Values[target.Env]; !ok {
+			return Response{Error: "env " + target.Env + " no longer exists"}
+		}
+		if len(p.Envs) <= 1 {
+			return Response{Error: "cannot remove the last environment"}
+		}
+		snap := cloneMap(u.vault.Values[target.Env])
+		delete(u.vault.Values, target.Env)
+		u.vault.Environments = removeStr(u.vault.Environments, target.Env)
+		p.Envs = removeStr(p.Envs, target.Env)
+		if p.ActiveEnv == target.Env {
+			p.ActiveEnv = p.Envs[0]
+		}
+		u.record(HistoryEntry{Op: "rmenv", Env: target.Env, Snapshot: snap})
+		structural = true
+		text = "removed environment " + target.Env + " (undo of add)"
+	case "rmenv":
+		if _, ok := u.vault.Values[target.Env]; ok {
+			return Response{Error: "env " + target.Env + " already exists"}
+		}
+		u.vault.Values[target.Env] = cloneMap(target.Snapshot)
+		u.vault.Environments = append(u.vault.Environments, target.Env)
+		p.Envs = append(p.Envs, target.Env)
+		u.record(HistoryEntry{Op: "addenv", Env: target.Env})
+		structural = true
+		text = fmt.Sprintf("restored environment %s (%d keys)", target.Env, len(target.Snapshot))
+	default:
+		return Response{Error: "cannot restore op " + target.Op}
+	}
+
+	if err := saveVault(p.Path, u.vault, u.vf, u.key); err != nil {
+		return Response{Error: err.Error()}
+	}
+	if structural {
+		d.saveState()
+	}
+	return Response{OK: true, Text: text}
 }
 
 func (d *Daemon) serve(conn net.Conn) {
@@ -1337,6 +1520,10 @@ func (d *Daemon) serve(conn net.Conn) {
 		resp = d.handleImport(req)
 	case "adopt":
 		resp = d.handleAdopt(req)
+	case "history":
+		resp = d.handleHistory(req)
+	case "restore":
+		resp = d.handleRestore(req)
 	default:
 		resp = Response{Error: "unknown cmd " + req.Cmd}
 	}
@@ -1872,6 +2059,74 @@ func cmdEnv(args []string) {
 	}
 }
 
+func maskStr(s string) string {
+	if s == "" {
+		return "∅"
+	}
+	n := len([]rune(s))
+	if n > 8 {
+		n = 8
+	}
+	if n < 3 {
+		n = 3
+	}
+	return strings.Repeat("•", n)
+}
+
+func formatHistEntry(e HistoryEntry) string {
+	t := e.Time.Local().Format("01-02 15:04:05")
+	loc := e.Env
+	if e.Key != "" {
+		loc = e.Env + "/" + e.Key
+	}
+	switch e.Op {
+	case "set":
+		from := "∅"
+		if e.HadOld {
+			from = maskStr(e.Old)
+		}
+		return fmt.Sprintf("[%d] %s  set     %-24s %s → %s", e.Seq, t, loc, from, maskStr(e.New))
+	case "unset":
+		return fmt.Sprintf("[%d] %s  unset   %-24s %s", e.Seq, t, loc, maskStr(e.Old))
+	case "addenv":
+		return fmt.Sprintf("[%d] %s  addenv  %s", e.Seq, t, e.Env)
+	case "rmenv":
+		return fmt.Sprintf("[%d] %s  rmenv   %-24s (%d keys)", e.Seq, t, e.Env, len(e.Snapshot))
+	}
+	return fmt.Sprintf("[%d] %s  %s  %s", e.Seq, t, e.Op, loc)
+}
+
+func cmdHistory(args []string) {
+	_, flags := parseFlags(args)
+	cwd, _ := os.Getwd()
+	resp := mustCall(Request{Cmd: "history", Cwd: cwd,
+		Args: map[string]string{"env": flags["env"], "key": flags["key"], "n": flags["n"]}})
+	if len(resp.History) == 0 {
+		fmt.Println("no history yet")
+		return
+	}
+	for _, e := range resp.History {
+		fmt.Println(formatHistEntry(e))
+	}
+	fmt.Println("\nrestore with: envd restore <seq>   (or `envd undo` for the latest)")
+}
+
+func cmdRestore(args []string) {
+	pos, _ := parseFlags(args)
+	if len(pos) < 1 {
+		fatalf("usage: envd restore <seq>   (see `envd history`)")
+	}
+	cwd, _ := os.Getwd()
+	resp := mustCall(Request{Cmd: "restore", Cwd: cwd, Args: map[string]string{"seq": pos[0]}})
+	fmt.Printf("✓ %s\n", resp.Text)
+}
+
+func cmdUndo() {
+	cwd, _ := os.Getwd()
+	resp := mustCall(Request{Cmd: "restore", Cwd: cwd, Args: map[string]string{"seq": "latest"}})
+	fmt.Printf("✓ %s\n", resp.Text)
+}
+
 func cmdStatus() {
 	resp := mustCall(Request{Cmd: "status"})
 	fmt.Print(resp.Text)
@@ -1893,6 +2148,10 @@ Usage:
   envd env ls                List this project's environments (* = active).
   envd set <KEY> [--env e]   Store a value (read from stdin). --env base = shared layer.
   envd unset <KEY> [--env e] Delete a value.
+  envd history [--env e] [--key K] [-n N]
+                             Show the change log (reflog) for this project.
+  envd restore <seq>         Roll back the change with that history seq number.
+  envd undo                  Roll back the most recent change.
   envd diff <envA> <envB>    Show which keys differ between two environments.
   envd doctor [--env e] [--example]
                              Scan code for env-var refs; flag missing/empty/placeholder/unused.
@@ -1948,6 +2207,12 @@ func main() {
 		cmdSet(rest)
 	case "unset":
 		cmdUnset(rest)
+	case "history", "log":
+		cmdHistory(rest)
+	case "restore":
+		cmdRestore(rest)
+	case "undo":
+		cmdUndo()
 	case "diff":
 		cmdDiff(rest)
 	case "doctor":

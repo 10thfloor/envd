@@ -1,7 +1,12 @@
 # envd — design spec
 
-Date: 2026-05-24
-Status: v0.1 (local core implemented; provider OAuth adapters scaffolded; remote platform sync deferred)
+Date: 2026-05-24 (kept current through v0.6, 2026-05-25)
+Status: v0.6 — local workflow complete and tested; provider OAuth machinery built
+(no vendor adapters ship yet); remote platform sync deferred.
+
+This document is append-only by version: the sections below the architecture
+record what each release added and why. For the current, complete command list
+see the [README](../README.md).
 
 ## Goal
 
@@ -11,8 +16,10 @@ developer **never has to handle or even see** the raw secret values. You referen
 `process.env.DATABASE_URL` as normal; whichever environment is active, the daemon
 fills it in at process launch.
 
-Single file, no third-party dependencies, extensible to other framework/platform
-vendors (Encore, Cloudflare, Fly.io) later.
+Originally specced as a single, dependency-free file. From v0.2 the TUI relaxed
+that (it uses Bubble Tea); the daemon core remains pure Go stdlib and the project
+still ships as one binary. Designed to extend to other framework/platform vendors
+(Encore, Cloudflare, Fly.io) later.
 
 ## Decisions (from brainstorming)
 
@@ -54,7 +61,8 @@ vendors (Encore, Cloudflare, Fly.io) later.
 
 - `~/.envd/state.json` — non-secret registry: project name, path, id, envs, active env.
 - `<project>/.envd/vault.json` — encrypted envelope: `{version, project, key_id, kdf, salt?,
-  nonce, ciphertext}`. Plaintext is JSON `{project, environments, values, providers}`.
+  nonce, ciphertext}`. Plaintext is JSON `{project, environments, base, values, providers,
+  history, next_seq}` (later fields added by v0.3+ and omitted/empty in older vaults).
 - Keychain item `envd / envd-<id>` — the per-project AES key (when kdf=keychain).
 
 ### Daily loop
@@ -69,7 +77,8 @@ vendors (Encore, Cloudflare, Fly.io) later.
 ## Extensibility
 
 `Adapter` interface: `Name() / OAuth() / ListResources() / FetchSecrets()`. New vendors are
-added in-source and recompiled (runtime plugins would violate single-file/no-deps). The OAuth
+added in-source and recompiled (runtime plugins would require a plugin runtime and pull in
+dependencies, against the dependency-free-core goal). The OAuth
 code-flow runner is generic stdlib; an adapter only supplies endpoints, client id, and the
 resource→secret mapping.
 
@@ -150,3 +159,24 @@ Completes the four-feature roadmap.
 - `main_test.go`: generators, OAuth flow (fake provider), dotenv parsing. `tui_test.go`: model.
 - Each feature additionally verified end-to-end against a live daemon (doctor flags, auto-adopt
   of a wiped-then-rediscovered vault, import, generator stability across exports).
+
+## v0.5 — custom environments (2026-05-25)
+
+- New projects now start with a single `dev` environment (was `dev,staging,prod`); a custom
+  comma-separated list can still be given at `envd connect` time.
+- `envd env add|rm|ls` manages environments from the CLI (previously TUI-only), reusing the
+  `addenv`/`rmenv` daemon handlers. `base` stays reserved; the last environment can't be removed.
+
+## v0.6 — reflog-style history (2026-05-25)
+
+- **Model:** `Vault.History []HistoryEntry` (capped at 500) plus a monotonic `NextSeq`. Every
+  mutation (`set`/`unset`/`import`/`addenv`/`rmenv`) is recorded via `unlocked.record(...)` with
+  the prior state — for `set`, the old value and whether it existed; for `rmenv`, a full snapshot
+  of the removed environment.
+- **Restore:** `handleRestore(seq)` applies the inverse of an entry and records the reversion
+  itself, so restores are re-undoable (true reflog behavior): `set` → revert or clear the key;
+  `unset` → re-set; `addenv` → remove the env; `rmenv` → recreate the env from its snapshot.
+- **Surface:** `envd history [--env e] [--key K] [-n N]` (values masked), `envd restore <seq>`,
+  `envd undo` (latest). TUI: `h` opens a history view, `enter`/`R` restores. New daemon commands
+  `history` and `restore`.
+- Backward compatible: vaults without history start empty and accumulate it going forward.

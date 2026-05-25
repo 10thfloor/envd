@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -36,6 +37,7 @@ const (
 	mPrompt
 	mConfirm
 	mDoctor
+	mHistory
 )
 
 type tfocus int
@@ -75,7 +77,24 @@ type (
 		report *DoctorReport
 		err    string
 	}
+	historyMsg struct {
+		entries []HistoryEntry
+		err     string
+	}
 )
+
+func runHistoryCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		r, err := daemonCall(Request{Cmd: "history", Args: map[string]string{"project": path, "n": "200"}})
+		if err != nil {
+			return historyMsg{err: err.Error()}
+		}
+		if !r.OK {
+			return historyMsg{err: r.Error}
+		}
+		return historyMsg{entries: r.History}
+	}
+}
 
 func runDoctorCmd(path, env string) tea.Cmd {
 	return func() tea.Msg {
@@ -142,16 +161,18 @@ type tuiModel struct {
 	vars     []VarView
 	tbl      table.Model
 
-	mode   tmode
-	focus  tfocus
-	reveal bool
-	in     textinput.Model
-	pk     pkind
-	ck     ckind
-	inCtx  string // key being edited / pending new key
-	doc    *DoctorReport
-	status string
-	w, h   int
+	mode    tmode
+	focus   tfocus
+	reveal  bool
+	in      textinput.Model
+	pk      pkind
+	ck      ckind
+	inCtx   string // key being edited / pending new key
+	doc     *DoctorReport
+	hist    []HistoryEntry
+	histIdx int
+	status  string
+	w, h    int
 }
 
 func newTUIModel() tuiModel {
@@ -342,6 +363,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = mDoctor
 		return m, nil
 
+	case historyMsg:
+		if msg.err != "" {
+			m.status = stErr.Render("✗ " + msg.err)
+			return m, nil
+		}
+		m.hist = msg.entries
+		if m.histIdx >= len(m.hist) {
+			m.histIdx = 0
+		}
+		m.mode = mHistory
+		return m, nil
+
 	case tea.KeyMsg:
 		switch m.mode {
 		case mPicker:
@@ -355,6 +388,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case mDoctor:
 			m.mode = mBrowse // any key dismisses
 			return m, nil
+		case mHistory:
+			return m.updateHistory(msg)
 		}
 	}
 	return m, nil
@@ -402,6 +437,9 @@ func (m tuiModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "D":
 		m.status = stDim.Render("scanning code…")
 		return m, runDoctorCmd(m.proj.Path, m.curEnv())
+	case "h":
+		m.histIdx = 0
+		return m, runHistoryCmd(m.proj.Path)
 	}
 
 	if m.focus == fEnvs {
@@ -521,9 +559,72 @@ func (m tuiModel) View() string {
 		return m.viewPicker()
 	case mDoctor:
 		return m.viewDoctor()
+	case mHistory:
+		return m.viewHistory()
 	default:
 		return m.viewBrowse()
 	}
+}
+
+func (m tuiModel) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", "h":
+		m.mode = mBrowse
+		return m, nil
+	case "up", "k":
+		if m.histIdx > 0 {
+			m.histIdx--
+		}
+	case "down", "j":
+		if m.histIdx < len(m.hist)-1 {
+			m.histIdx++
+		}
+	case "enter", "R", "r":
+		if m.histIdx < len(m.hist) {
+			seq := m.hist[m.histIdx].Seq
+			r, err := daemonCall(Request{Cmd: "restore", Args: map[string]string{
+				"project": m.proj.Path, "seq": strconv.Itoa(seq)}})
+			switch {
+			case err != nil:
+				m.status = stErr.Render("✗ " + err.Error())
+			case !r.OK:
+				m.status = stErr.Render("✗ " + r.Error)
+			default:
+				m.status = stOK.Render("✓ " + r.Text)
+			}
+			return m, tea.Batch(runHistoryCmd(m.proj.Path), m.reloadVars(), loadProjectsCmd())
+		}
+	}
+	return m, nil
+}
+
+func (m tuiModel) viewHistory() string {
+	var b strings.Builder
+	b.WriteString(stHeader.Render(fmt.Sprintf("history · %s  (newest first)", m.proj.Name)) + "\n\n")
+	if len(m.hist) == 0 {
+		b.WriteString(stDim.Render("  no history yet\n"))
+	}
+	window := m.h - 7
+	if window < 5 {
+		window = 5
+	}
+	start := 0
+	if m.histIdx >= window {
+		start = m.histIdx - window + 1
+	}
+	for i := start; i < len(m.hist) && i < start+window; i++ {
+		line := formatHistEntry(m.hist[i])
+		if i == m.histIdx {
+			b.WriteString(stCursor.Render("› "+line) + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	if m.status != "" {
+		b.WriteString("\n" + m.status)
+	}
+	b.WriteString("\n" + stDim.Render("↑/↓ move · enter/R restore · h/esc back"))
+	return b.String()
 }
 
 func (m tuiModel) viewDoctor() string {
@@ -638,9 +739,9 @@ func (m tuiModel) viewBrowse() string {
 	default:
 		var hints string
 		if m.focus == fEnvs {
-			hints = "tab→vars · ↑/↓ env · a set-active · A add-env · X del-env · r reveal · D doctor · p projects · q quit"
+			hints = "tab→vars · ↑/↓ env · a set-active · A add-env · X del-env · r reveal · D doctor · h history · q quit"
 		} else {
-			hints = "tab→envs · ↑/↓ row · n new · e edit · d delete · r reveal · D doctor · p projects · q quit"
+			hints = "tab→envs · ↑/↓ row · n new · e edit · d delete · r reveal · D doctor · h history · q quit"
 		}
 		footer = m.status
 		if footer != "" {

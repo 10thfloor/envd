@@ -83,6 +83,35 @@ func TestTUIModel(t *testing.T) {
 	}
 }
 
+func TestTUIHistory(t *testing.T) {
+	m := newTUIModel()
+	apply := func(msg tea.Msg) { nm, _ := m.Update(msg); m = nm.(tuiModel) }
+	apply(tea.WindowSizeMsg{Width: 100, Height: 30})
+	apply(projectsMsg{projects: []ProjectView{
+		{Name: "app", Path: "/tmp/app", Envs: []string{"dev"}, ActiveEnv: "dev"},
+	}})
+	apply(tea.KeyMsg{Type: tea.KeyEnter}) // open project
+	apply(historyMsg{entries: []HistoryEntry{
+		{Seq: 2, Op: "set", Env: "dev", Key: "FOO", Old: "secret-a", HadOld: true, New: "secret-b"},
+		{Seq: 1, Op: "set", Env: "dev", Key: "FOO", New: "secret-a"},
+	}})
+	if m.mode != mHistory {
+		t.Fatal("historyMsg should enter history mode")
+	}
+	v := m.View()
+	if !strings.Contains(v, "FOO") || !strings.Contains(v, "history") {
+		t.Fatalf("history view missing expected content:\n%s", v)
+	}
+	if strings.Contains(v, "secret-a") || strings.Contains(v, "secret-b") {
+		t.Fatal("history view must mask values")
+	}
+	apply(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}) // move
+	apply(tea.KeyMsg{Type: tea.KeyEsc})                       // back
+	if m.mode != mBrowse {
+		t.Fatal("esc should leave history view")
+	}
+}
+
 func TestMask(t *testing.T) {
 	if got := mask(VarView{Value: "abcdefghijklmnop"}, false); strings.ContainsAny(got, "abc") {
 		t.Fatalf("masked value leaked content: %q", got)

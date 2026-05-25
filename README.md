@@ -12,16 +12,15 @@ You reference `process.env.DATABASE_URL` in your code as normal. Whichever
 environment is active, `envd` injects the right value at process launch, straight
 into the environment — nothing written to disk, no value ever printed.
 
-> Status: **v0.5**. Complete and tested: the env-switching core, an interactive
-> **TUI** (`envd tui`), 1Password-style **reference interpolation**, **layered
-> environments** (`base` + overrides, `envd diff`), a **code-aware doctor**
-> (`envd doctor`), **zero-step onboarding** (`envd import` + auto-adopt on `cd`),
-> and **value generators** (`gen://…`). The provider **OAuth machinery** is built
-> and tested against a fake provider; concrete vendor adapters need your own OAuth
-> app credentials. Remote platform sync (Fly/Cloudflare/Encore) is deferred.
+> **Status: v0.6 — usable, early.** The full local workflow is implemented and
+> tested: per-environment injection, layered environments, reference interpolation,
+> value generators, reflog-style history with rollback, a code-aware doctor,
+> zero-step onboarding, and an interactive TUI. The provider OAuth machinery is
+> built and tested, but no concrete vendor adapters ship yet (each needs its own
+> OAuth app). Remote platform sync (Fly/Cloudflare/Encore) is deferred.
 >
-> The daemon core is pure Go stdlib (zero deps). The TUI adds the Bubble Tea
-> libraries; everything still ships as one binary.
+> The daemon core is pure Go stdlib; only the TUI pulls in third-party libraries
+> (Bubble Tea). Everything ships as one binary.
 
 ## How it works
 
@@ -102,6 +101,9 @@ envd use dev            # back to dev
 | `envd env add\|rm\|ls [name]` | Add, remove, or list environments. |
 | `envd set <KEY> [--env e]` | Store a value (read from stdin). `--env base` targets the shared layer. |
 | `envd unset <KEY> [--env e]` | Delete a value. |
+| `envd history [--env e] [--key K] [-n N]` | Show the project's change log (reflog). |
+| `envd restore <seq>` | Roll back the change with that history seq. |
+| `envd undo` | Roll back the most recent change. |
 | `envd diff <envA> <envB>` | Show which keys differ between two environments (values masked). |
 | `envd doctor [--env e] [--example]` | Scan code for env-var refs; flag missing/empty/placeholder/unused. `--example` writes `.env.example`. |
 | `envd import [file] [--env e]` | Import a `.env` file (default `./.env`) into an environment. |
@@ -185,6 +187,26 @@ printf 'redis://${gen://password/16}@cache' | envd set CACHE_URL # embedded
 
 Kinds: `random/N` (base64), `hex/N`, `uuid`, `password/N` (alphanumeric).
 
+## History & rollback (`envd history` / `restore` / `undo`)
+
+Every change to a project's vault is recorded in a reflog-like log with the prior
+state, so you can always roll back:
+
+```sh
+envd history
+# [12] 05-25 09:48  set     dev/DATABASE_URL   ••• → ••••••
+# [11] 05-25 09:47  unset   dev/OLD_TOKEN      •••
+# [10] 05-25 09:40  rmenv   qa                 (3 keys)
+
+envd restore 12     # revert DATABASE_URL to its value before change #12
+envd undo           # revert the most recent change
+envd restore 10     # bring back the removed `qa` environment, with its contents
+```
+
+Values are masked in the log. Restores are themselves recorded, so an `undo` of a
+restore puts things back. In the TUI, press `h` to browse history and `enter`/`R`
+to restore the selected entry.
+
 ## Doctor (`envd doctor`)
 
 Scans your source for env-var references (`process.env.X`, `import.meta.env.X`,
@@ -213,13 +235,29 @@ app/dev — scanned 37 file(s), 12 var(s) referenced
 - **Import:** `envd import .env` absorbs an existing dotenv file into an
   environment (`--env base` to put shared keys in the base layer).
 
-## Providers (OAuth) — machinery ready
+## Providers & custom adapters
 
-`envd connect <provider>` runs an OAuth authorization-code flow and imports a
-provider's per-environment values into the vault. The flow, the loopback
-callback, and token exchange are implemented and tested. Shipping a concrete
-vendor adapter (Neon, Upstash, …) requires registering an OAuth app and supplying
-its client ID — implement the `Adapter` interface and `registerAdapter` it.
+`envd connect <provider>` runs an OAuth authorization-code flow and pulls a
+provider's per-environment values straight into the vault — connect once, never
+paste a key. The flow (loopback callback + token exchange) is implemented and
+tested; **no concrete vendor adapters ship yet**, because each needs its own
+registered OAuth app and client ID.
+
+Adding one is small — implement the `Adapter` interface and register it in `init()`:
+
+```go
+type Adapter interface {
+    Name() string
+    OAuth() OAuthConfig
+    ListResources(ctx context.Context, accessToken string) ([]Resource, error)
+    FetchSecrets(ctx context.Context, accessToken, resourceID, envName string) (map[string]string, error)
+}
+```
+
+The generic OAuth runner (`runOAuth`) is provided; an adapter only supplies its
+endpoints, client ID, and the resource→secret mapping. New vendors are added
+in-source and recompiled — the daemon core stays dependency-free. The same shape
+will later grow a `PlatformAdapter` for the deferred deployment-sync side.
 
 ## Showing the active environment in your prompt
 
@@ -231,7 +269,7 @@ unmistakable:
 PROMPT='%~ ${ENVD_ENV:+(envd:$ENVD_ENV) }%# '
 ```
 
-## Security model
+## Security
 
 - Secret values are encrypted at rest (AES-256-GCM) and only ever exist decrypted
   in the daemon's memory and in the target process's environment.
@@ -244,39 +282,15 @@ PROMPT='%~ ${ENVD_ENV:+(envd:$ENVD_ENV) }%# '
   the decryption key has the secrets, so guard Keychain access / the passphrase
   accordingly.
 
-## Extending to new providers
-
-Implement the `Adapter` interface and register it in `init()`:
-
-```go
-type Adapter interface {
-    Name() string
-    OAuth() OAuthConfig
-    ListResources(ctx context.Context, accessToken string) ([]Resource, error)
-    FetchSecrets(ctx context.Context, accessToken, resourceID, envName string) (map[string]string, error)
-}
-```
-
-The generic OAuth authorization-code flow (`runOAuth`) is built in — an adapter
-only supplies its endpoints, client id, and the resource→secret mapping. Adding a
-vendor means editing the single source file and recompiling (runtime plugins would
-break the single-file/no-dependency guarantee). The same shape will later grow a
-`PlatformAdapter` for the deferred deployment-sync side.
-
-## Design
-
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and the decisions behind it.
-
-## Contributing
-
-Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). The daemon core
-is kept dependency-free; the TUI is the only place third-party libraries live.
-
-## Security
-
-envd is explicit about what it does and doesn't protect. Please read
+envd is explicit about what it does **not** protect against, too. Read
 [`SECURITY.md`](SECURITY.md) before trusting it with real secrets, and report
 vulnerabilities privately (not via public issues).
+
+## Design & contributing
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and the decisions
+behind it, and [`CONTRIBUTING.md`](CONTRIBUTING.md) to hack on it — the daemon core
+is kept dependency-free; the TUI is the only place third-party libraries live.
 
 ## License
 
